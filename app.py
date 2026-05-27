@@ -10,7 +10,7 @@ from pathlib import Path
 APP_TITLE = "Torneos de Ajedrez"
 DB_PATH = Path("torneos_ajedrez.db")
 API_BASE = "https://api.chess.com/pub"
-HEADERS = {"User-Agent": "torneos-ajedrez-streamlit/5.0"}
+HEADERS = {"User-Agent": "torneos-ajedrez-streamlit/6.0"}
 DEFAULT_PASSWORD = "12345"
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
@@ -759,6 +759,108 @@ def import_history_csv(df, created_by):
             imported += 1
     return imported
 
+
+def import_fixture_csv(df, created_by, default_rules="chess", default_time_class="blitz", default_time_control="300", default_rated_filter="any", strict_colors=True):
+    required = {"torneo", "ronda", "fecha_inicio", "fecha_fin", "blancas_chesscom", "negras_chesscom"}
+    missing = required - set(df.columns)
+    if missing:
+        raise Exception(f"Faltan columnas: {', '.join(missing)}")
+
+    created_matches = 0
+    created_players = 0
+
+    for torneo_name, group in df.groupby("torneo"):
+        torneo_name = str(torneo_name).strip()
+        if not torneo_name:
+            continue
+
+        tid_row = q("SELECT * FROM tournaments WHERE name=? AND historical=0", (torneo_name,), one=True)
+        max_round = int(pd.to_numeric(group["ronda"], errors="coerce").fillna(1).max())
+
+        if tid_row:
+            tid = tid_row["id"]
+        else:
+            tid = exec_sql("""
+                INSERT INTO tournaments(
+                    name, description, status, tournament_type, rules, time_class, time_control,
+                    rated_filter, swiss_rounds, pairing_mode_round1, strict_colors, playoff_enabled,
+                    historical, created_by
+                )
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                torneo_name,
+                "Fixture pendiente importado para detección automática",
+                "playing",
+                "fixture_importado",
+                default_rules,
+                default_time_class,
+                default_time_control,
+                default_rated_filter,
+                max_round,
+                "manual",
+                1 if strict_colors else 0,
+                0,
+                0,
+                created_by
+            ))
+
+        for ronda, rg in group.groupby("ronda"):
+            ronda = int(ronda)
+            fi = pd.to_datetime(rg["fecha_inicio"], errors="coerce").min()
+            ff = pd.to_datetime(rg["fecha_fin"], errors="coerce").max()
+            if pd.isna(fi) or pd.isna(ff):
+                continue
+
+            fi_txt = fi.to_pydatetime().isoformat(timespec="seconds")
+            ff_txt = ff.to_pydatetime().isoformat(timespec="seconds")
+
+            rw = q("SELECT id FROM round_windows WHERE tournament_id=? AND round_number=?", (tid, ronda), one=True)
+            if rw:
+                exec_sql("""
+                    UPDATE round_windows
+                    SET start_datetime=?, end_datetime=?
+                    WHERE tournament_id=? AND round_number=?
+                """, (fi_txt, ff_txt, tid, ronda))
+            else:
+                exec_sql("""
+                    INSERT INTO round_windows(tournament_id,round_number,start_datetime,end_datetime)
+                    VALUES(?,?,?,?)
+                """, (tid, ronda, fi_txt, ff_txt))
+
+            r = q("SELECT id FROM rounds WHERE tournament_id=? AND number=?", (tid, ronda), one=True)
+            if r:
+                rid = r["id"]
+            else:
+                rid = exec_sql("""
+                    INSERT INTO rounds(tournament_id,number,status,started_at)
+                    VALUES(?,?,?,?)
+                """, (tid, ronda, "active", fi_txt))
+
+            for _, row in rg.iterrows():
+                white_ch = norm(row["blancas_chesscom"])
+                black_ch = norm(row["negras_chesscom"])
+                if not white_ch or not black_ch:
+                    continue
+
+                w_id, w_created = get_or_create_player_by_chess(white_ch, created_by=created_by)
+                b_id, b_created = get_or_create_player_by_chess(black_ch, created_by=created_by)
+                created_players += int(w_created) + int(b_created)
+
+                register_player(tid, w_id, created_by)
+                register_player(tid, b_id, created_by)
+
+                exists = q("""
+                    SELECT id FROM matches
+                    WHERE tournament_id=? AND round_id=? AND white_user_id=? AND black_user_id=?
+                """, (tid, rid, w_id, b_id), one=True)
+                if exists:
+                    continue
+
+                add_match(tid, rid, w_id, b_id, manual=1, status="pending", result=None, imported=1)
+                created_matches += 1
+
+    return created_matches, created_players
+
 # =========================
 # UI
 # =========================
@@ -781,7 +883,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("♟️ Torneos de Ajedrez — V5")
+st.title("♟️ Torneos de Ajedrez — V6")
 
 if not st.session_state.user:
     st.markdown('<div class="login-card">', unsafe_allow_html=True)
@@ -841,7 +943,7 @@ if user["must_change_password"]:
 
 menus = ["Torneos", "Crear torneo", "Mi perfil", "Ranking general"]
 if is_staff(user):
-    menus += ["Importar historial", "Admin usuarios"]
+    menus += ["Importar fixture", "Importar historial", "Admin usuarios"]
 menu = st.sidebar.radio("Menú", menus)
 
 if menu == "Crear torneo":
@@ -1096,6 +1198,61 @@ elif menu == "Ranking general":
         "Nombre": u["display_name"], "Chess.com": u["chesscom_user"], "ELO": u["elo"], "Rol": u["role"],
         "Estado": u["account_status"], "Clave temporal": "Sí" if u["must_change_password"] else "No"
     } for u in users], use_container_width=True)
+
+
+elif menu == "Importar fixture":
+    st.header("Importar fixture pendiente")
+    st.write("Este módulo crea torneos, rondas, participantes y cruces pendientes. Después el motor de Chess.com busca los resultados dentro del rango de cada ronda.")
+
+    st.info("Columnas requeridas: torneo, ronda, fecha_inicio, fecha_fin, blancas_chesscom, negras_chesscom")
+
+    ejemplo = pd.DataFrame([
+        {
+            "torneo": "TORNEO N°11",
+            "ronda": 1,
+            "fecha_inicio": "2026-02-27 00:00",
+            "fecha_fin": "2026-03-12 23:59",
+            "blancas_chesscom": "matiasbulacio",
+            "negras_chesscom": "juan123"
+        }
+    ])
+    st.download_button(
+        "Descargar plantilla CSV fixture",
+        ejemplo.to_csv(index=False).encode("utf-8"),
+        "plantilla_fixture_pendiente.csv",
+        "text/csv"
+    )
+
+    st.subheader("Reglas del torneo importado")
+    c1, c2, c3 = st.columns(3)
+    rules = "chess" if c1.selectbox("Modalidad", ["Ajedrez normal", "Chess960"], key="fixture_rules") == "Ajedrez normal" else "chess960"
+    time_class = c2.selectbox("Clase", ["blitz", "rapid", "bullet", "daily"], key="fixture_time_class")
+    time_control = c3.text_input("Ritmo exacto", value="300", key="fixture_time_control", help="300=5+0, 600=10+0, 180+2=3+2")
+    rated_filter = {"Cualquiera":"any", "Solo rated":"rated", "Solo casual":"casual"}[
+        st.selectbox("Rated/Casual", ["Cualquiera", "Solo rated", "Solo casual"], key="fixture_rated")
+    ]
+    strict_colors = st.checkbox("Respetar colores exactos del fixture", value=True, key="fixture_strict_colors")
+
+    file = st.file_uploader("CSV de fixture pendiente", type=["csv"], key="fixture_csv")
+    if file:
+        df = pd.read_csv(file)
+        st.dataframe(df, use_container_width=True)
+
+        if st.button("Importar fixture pendiente"):
+            try:
+                matches, players = import_fixture_csv(
+                    df,
+                    created_by=user["id"],
+                    default_rules=rules,
+                    default_time_class=time_class,
+                    default_time_control=time_control,
+                    default_rated_filter=rated_filter,
+                    strict_colors=strict_colors
+                )
+                st.success(f"Fixture importado. Cruces creados: {matches}. Jugadores nuevos creados: {players}.")
+                st.info("Ahora andá a Torneos → Buscar resultados Chess.com.")
+            except Exception as e:
+                st.error(e)
 
 elif menu == "Importar historial":
     st.header("Importar torneos anteriores")

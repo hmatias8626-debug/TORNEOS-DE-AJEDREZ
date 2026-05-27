@@ -1,33 +1,22 @@
-# TORNEOS-DE-AJEDREZ V5
+# TORNEOS-DE-AJEDREZ V6
 
-Cambios principales:
-- Login más compacto.
-- Modelo de perfiles por Chess.com:
-  - usuario = chesscom_user
-  - clave inicial = 12345
-  - estado pending/active/suspended
-  - al primer ingreso pasa a activo y debe cambiar contraseña.
-- Admin puede:
-  - crear jugadores rápidos con clave 12345
-  - resetear contraseña a 12345
-  - cambiar roles
-  - suspender usuarios
-  - agregar participantes a torneos aunque la inscripción esté cerrada
-  - quitar/descalificar/reactivar participantes de un torneo
-- Roles:
-  - superadmin
-  - admin
-  - moderator
-  - player
-- Al comenzar el torneo se cierra inscripción pública.
-- Staff puede agregar jugadores después de iniciado.
-- WO:
-  - si vence la ronda y no se detecta partida, se puede aplicar 0-0 WO
-  - ambos reciben advertencia WO
-  - al segundo WO quedan descalificados
-  - WO no modifica ELO
-- Mantiene:
-  - torneo suizo
-  - fixture libre
-  - importación histórica
-  - detección Chess.com por colores, ritmo, modalidad y rango de fechas.
+Agrega sobre V5:
+
+## Importar fixture pendiente
+
+Permite cargar un CSV con cruces todavía no resueltos para que el motor busque automáticamente las partidas en Chess.com.
+
+Columnas requeridas:
+
+torneo,ronda,fecha_inicio,fecha_fin,blancas_chesscom,negras_chesscom
+
+Luego:
+Torneos → Buscar resultados Chess.com
+
+Validaciones:
+- blancas exactas
+- negras exactas
+- modalidad
+- ritmo
+- rated/casual
+- fecha dentro del rango de ronda
