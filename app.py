@@ -89,6 +89,15 @@ def init_db():
     """)
 
     cur.execute("""
+    CREATE TABLE IF NOT EXISTS chess_aliases (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        alias TEXT UNIQUE,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cur.execute("""
     CREATE TABLE IF NOT EXISTS tournaments (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT,
@@ -211,6 +220,17 @@ def norm(value):
     return (str(value) if value is not None else "").strip().lower()
 
 
+def valid_chess_username(value):
+    value = norm(value)
+    if not value:
+        return False
+    if value in {"0", "nan", "none", "null", "-"}:
+        return False
+    if len(value) < 2:
+        return False
+    return True
+
+
 def hash_password(password):
     return hashlib.sha256(str(password).encode("utf-8")).hexdigest()
 
@@ -257,8 +277,8 @@ def sync_avatar(user_id, chesscom_user):
 
 def get_or_create_player(chesscom_user, display_name=None):
     chesscom_user = norm(chesscom_user)
-    if not chesscom_user:
-        raise ValueError("Usuario Chess.com vacío")
+    if not valid_chess_username(chesscom_user):
+        raise ValueError(f"Usuario Chess.com inválido: {chesscom_user}")
 
     row = q("SELECT * FROM users WHERE chesscom_user=?", (chesscom_user,), one=True)
     if row:
@@ -284,6 +304,48 @@ def get_or_create_player(chesscom_user, display_name=None):
     sync_avatar(user_id, chesscom_user)
     return user_id, True
 
+
+
+def add_chess_alias(user_id, alias):
+    alias = norm(alias)
+    if not valid_chess_username(alias):
+        raise ValueError("Alias inválido.")
+    exec_sql("INSERT OR IGNORE INTO chess_aliases(user_id, alias) VALUES(?,?)", (user_id, alias))
+
+
+def username_belongs_to_user(chess_name, user_id):
+    chess_name = norm(chess_name)
+    user = get_user(user_id)
+    if user and norm(user["chesscom_user"]) == chess_name:
+        return True
+    alias = q("SELECT id FROM chess_aliases WHERE user_id=? AND alias=?", (user_id, chess_name), one=True)
+    return alias is not None
+
+
+def update_user_chess(user_id, new_chess, new_display=None, add_old_as_alias=True):
+    new_chess = norm(new_chess)
+    if not valid_chess_username(new_chess):
+        raise ValueError("Usuario Chess.com inválido.")
+
+    user = get_user(user_id)
+    if not user:
+        raise ValueError("Usuario no encontrado.")
+
+    old_chess = norm(user["chesscom_user"])
+    existing = q("SELECT id FROM users WHERE chesscom_user=? AND id<>?", (new_chess, user_id), one=True)
+    if existing:
+        raise ValueError("Ese usuario Chess.com ya pertenece a otro perfil.")
+
+    if add_old_as_alias and valid_chess_username(old_chess) and old_chess != new_chess:
+        add_chess_alias(user_id, old_chess)
+
+    display = new_display.strip() if new_display else user["display_name"]
+    exec_sql("""
+        UPDATE users
+        SET chesscom_user=?, username=?, display_name=?
+        WHERE id=?
+    """, (new_chess, new_chess, display, user_id))
+    sync_avatar(user_id, new_chess)
 
 def create_or_claim_user(username, password, chesscom_user, display_name):
     username = norm(username) or norm(chesscom_user)
@@ -420,11 +482,25 @@ def validate_game(game, white_user, black_user, tournament, start_dt, end_dt):
     white = norm(game.get("white", {}).get("username"))
     black = norm(game.get("black", {}).get("username"))
 
+    # white_user / black_user are user IDs in V7.2 validator wrapper when possible
+    if isinstance(white_user, int) and isinstance(black_user, int):
+        white_ok = username_belongs_to_user(white, white_user)
+        black_ok = username_belongs_to_user(black, black_user)
+        white_inv = username_belongs_to_user(white, black_user)
+        black_inv = username_belongs_to_user(black, white_user)
+    else:
+        white_ok = white == norm(white_user)
+        black_ok = black == norm(black_user)
+        white_inv = white == norm(black_user)
+        black_inv = black == norm(white_user)
+
     if tournament["strict_colors"]:
-        if white != norm(white_user) or black != norm(black_user):
+        if not (white_ok and black_ok):
+            if white_inv and black_inv:
+                return False, "colores invertidos"
             return False, "colores/usuarios no coinciden"
     else:
-        if {white, black} != {norm(white_user), norm(black_user)}:
+        if not ((white_ok and black_ok) or (white_inv and black_inv)):
             return False, "usuarios no coinciden"
 
     if game.get("rules") != tournament["rules"]:
@@ -661,8 +737,12 @@ def import_fixture_csv(df, created_by, rules, time_class, time_control, rated_fi
             ))
 
             for _, row in round_df.iterrows():
-                white_id, white_created = get_or_create_player(row["blancas_chesscom"])
-                black_id, black_created = get_or_create_player(row["negras_chesscom"])
+                white_raw = norm(row["blancas_chesscom"])
+                black_raw = norm(row["negras_chesscom"])
+                if not valid_chess_username(white_raw) or not valid_chess_username(black_raw):
+                    continue
+                white_id, white_created = get_or_create_player(white_raw)
+                black_id, black_created = get_or_create_player(black_raw)
                 created_players += int(white_created) + int(black_created)
 
                 register_player(tournament_id, white_id)
@@ -743,8 +823,12 @@ def import_rounds_to_existing_tournament(df, tournament_id):
             ))
 
         for _, row in round_df.iterrows():
-            white_id, white_created = get_or_create_player(row["blancas_chesscom"])
-            black_id, black_created = get_or_create_player(row["negras_chesscom"])
+            white_raw = norm(row["blancas_chesscom"])
+            black_raw = norm(row["negras_chesscom"])
+            if not valid_chess_username(white_raw) or not valid_chess_username(black_raw):
+                continue
+            white_id, white_created = get_or_create_player(white_raw)
+            black_id, black_created = get_or_create_player(black_raw)
 
             created_players += int(white_created) + int(black_created)
 
@@ -798,8 +882,8 @@ def scan_tournament(tournament_id):
         for game in games:
             ok, reason = validate_game(
                 game,
-                match["white_chess"],
-                match["black_chess"],
+                match["white_user_id"],
+                match["black_user_id"],
                 tournament,
                 start_dt,
                 end_dt,
@@ -895,7 +979,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("♟️ Torneos de Ajedrez — V7.1.1")
+st.title("♟️ Torneos de Ajedrez — V7.2")
 
 if not st.session_state.user:
     st.markdown('<div class="login-box">', unsafe_allow_html=True)
@@ -1227,6 +1311,38 @@ elif choice == "Admin usuarios":
         "Estado": u["account_status"],
         "Clave temporal": "Sí" if u["must_change_password"] else "No",
     } for u in users], use_container_width=True)
+
+
+    st.subheader("Corregir usuario Chess.com")
+    labels_edit = {f"{u['display_name']} ({u['chesscom_user']})": u["id"] for u in users}
+    if labels_edit:
+        edit_selected = st.selectbox("Perfil a corregir", list(labels_edit.keys()), key="edit_chess_profile")
+        edit_user = get_user(labels_edit[edit_selected])
+
+        current_aliases = q("SELECT alias FROM chess_aliases WHERE user_id=? ORDER BY alias", (edit_user["id"],))
+        st.caption("Alias actuales: " + (", ".join([a["alias"] for a in current_aliases]) if current_aliases else "sin alias"))
+
+        new_chess_name = st.text_input("Nuevo usuario Chess.com principal", value=edit_user["chesscom_user"], key="new_chess_name")
+        new_display_name = st.text_input("Nombre visible", value=edit_user["display_name"], key="new_display_name")
+        keep_alias = st.checkbox("Guardar usuario anterior como alias", value=True, key="keep_old_alias")
+
+        if st.button("Guardar corrección Chess.com"):
+            try:
+                update_user_chess(edit_user["id"], new_chess_name, new_display_name, keep_alias)
+                st.success("Usuario Chess.com corregido.")
+                st.rerun()
+            except Exception as exc:
+                st.error(exc)
+
+        alias_to_add = st.text_input("Agregar alias Chess.com", key="alias_to_add")
+        if st.button("Agregar alias"):
+            try:
+                add_chess_alias(edit_user["id"], alias_to_add)
+                st.success("Alias agregado.")
+                st.rerun()
+            except Exception as exc:
+                st.error(exc)
+
 
     st.subheader("Crear jugador con clave 12345")
     new_chess = st.text_input("Usuario Chess.com nuevo")

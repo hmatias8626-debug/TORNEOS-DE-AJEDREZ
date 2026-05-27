@@ -1,3 +1,9 @@
-# TORNEOS V7.1.1
+# TORNEOS-DE-AJEDREZ V7.2
 
-Corrige migración de columnas faltantes en tournaments.
+Correcciones:
+- Admin puede corregir usuario Chess.com de cualquier jugador.
+- Admin puede agregar alias Chess.com.
+- El motor acepta alias al detectar partidas.
+- El motor informa mejor colores invertidos.
+- Importación ignora usuarios inválidos como 0, vacío, nan.
+- Normaliza usuarios a minúsculas.
