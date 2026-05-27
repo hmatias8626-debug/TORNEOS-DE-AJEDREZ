@@ -182,7 +182,17 @@ def init_db():
         ("tournaments", "playoff_rules", "TEXT DEFAULT 'chess'"),
         ("tournaments", "playoff_time_class", "TEXT DEFAULT 'blitz'"),
         ("tournaments", "playoff_time_control", "TEXT DEFAULT '300'"),
+        ("tournaments", "tournament_type", "TEXT DEFAULT 'fixture'"),
+        ("tournaments", "rules", "TEXT DEFAULT 'chess'"),
+        ("tournaments", "time_class", "TEXT DEFAULT 'blitz'"),
+        ("tournaments", "time_control", "TEXT DEFAULT '600'"),
+        ("tournaments", "rated_filter", "TEXT DEFAULT 'any'"),
+        ("tournaments", "strict_colors", "INTEGER DEFAULT 1"),
+        ("tournaments", "playoff_rules", "TEXT DEFAULT 'chess'"),
+        ("tournaments", "playoff_time_class", "TEXT DEFAULT 'blitz'"),
+        ("tournaments", "playoff_time_control", "TEXT DEFAULT '300'"),
         ("tournaments", "playoff_rated_filter", "TEXT DEFAULT 'any'"),
+        ("tournaments", "created_by", "INTEGER"),
         ("registrations", "status", "TEXT DEFAULT 'active'"),
         ("registrations", "wo_count", "INTEGER DEFAULT 0"),
         ("matches", "result_type", "TEXT DEFAULT 'normal'"),
@@ -885,7 +895,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("♟️ Torneos de Ajedrez — V7.1")
+st.title("♟️ Torneos de Ajedrez — V7.1.1")
 
 if not st.session_state.user:
     st.markdown('<div class="login-box">', unsafe_allow_html=True)

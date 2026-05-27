@@ -1,12 +1,3 @@
-# TORNEOS-DE-AJEDREZ V7.1 ESTABLE
+# TORNEOS V7.1.1
 
-Agrega sobre V7:
-- Crear torneo vacío/manual.
-- Importar rondas/cruces a un torneo existente.
-- Importar fixture completo como antes.
-
-CSV para importar rondas:
-ronda,fecha_inicio,fecha_fin,blancas_chesscom,negras_chesscom
-
-CSV para importar fixture completo:
-torneo,ronda,fecha_inicio,fecha_fin,blancas_chesscom,negras_chesscom
+Corrige migración de columnas faltantes en tournaments.
