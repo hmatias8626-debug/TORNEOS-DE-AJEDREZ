@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+torneos_ajedrez.db
+.streamlit/
