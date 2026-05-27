@@ -668,6 +668,98 @@ def import_fixture_csv(df, created_by, rules, time_class, time_control, rated_fi
     return created_matches, created_players
 
 
+
+def create_empty_tournament(name, description, rules, time_class, time_control, rated_filter, strict_colors, created_by):
+    return exec_sql("""
+        INSERT INTO tournaments(name,description,status,tournament_type,rules,time_class,time_control,rated_filter,strict_colors,created_by)
+        VALUES(?,?,?,?,?,?,?,?,?,?)
+    """, (
+        name,
+        description,
+        "open",
+        "manual",
+        rules,
+        time_class,
+        str(time_control),
+        rated_filter,
+        1 if strict_colors else 0,
+        created_by,
+    ))
+
+
+def import_rounds_to_existing_tournament(df, tournament_id):
+    required = {"ronda", "fecha_inicio", "fecha_fin", "blancas_chesscom", "negras_chesscom"}
+    missing = required - set(df.columns)
+    if missing:
+        raise Exception(f"Faltan columnas: {', '.join(sorted(missing))}")
+
+    created_matches = 0
+    created_players = 0
+
+    for round_number, round_df in df.groupby("ronda"):
+        round_number = int(round_number)
+        start_value = pd.to_datetime(round_df["fecha_inicio"], errors="coerce").min()
+        end_value = pd.to_datetime(round_df["fecha_fin"], errors="coerce").max()
+
+        if pd.isna(start_value) or pd.isna(end_value):
+            continue
+
+        existing_round = q(
+            "SELECT id FROM rounds WHERE tournament_id=? AND number=?",
+            (tournament_id, round_number),
+            one=True,
+        )
+
+        if existing_round:
+            round_id = existing_round["id"]
+            exec_sql(
+                "UPDATE rounds SET start_datetime=?, end_datetime=? WHERE id=?",
+                (
+                    start_value.to_pydatetime().isoformat(timespec="seconds"),
+                    end_value.to_pydatetime().isoformat(timespec="seconds"),
+                    round_id,
+                ),
+            )
+        else:
+            round_id = exec_sql("""
+                INSERT INTO rounds(tournament_id,number,start_datetime,end_datetime,status)
+                VALUES(?,?,?,?,?)
+            """, (
+                tournament_id,
+                round_number,
+                start_value.to_pydatetime().isoformat(timespec="seconds"),
+                end_value.to_pydatetime().isoformat(timespec="seconds"),
+                "active",
+            ))
+
+        for _, row in round_df.iterrows():
+            white_id, white_created = get_or_create_player(row["blancas_chesscom"])
+            black_id, black_created = get_or_create_player(row["negras_chesscom"])
+
+            created_players += int(white_created) + int(black_created)
+
+            register_player(tournament_id, white_id)
+            register_player(tournament_id, black_id)
+
+            exists = q("""
+                SELECT id FROM matches
+                WHERE tournament_id=? AND round_id=? AND white_user_id=? AND black_user_id=?
+            """, (tournament_id, round_id, white_id, black_id), one=True)
+
+            if exists:
+                continue
+
+            exec_sql("""
+                INSERT INTO matches(tournament_id,round_id,white_user_id,black_user_id,status,locked)
+                VALUES(?,?,?,?,?,?)
+            """, (tournament_id, round_id, white_id, black_id, "pending", 0))
+            created_matches += 1
+
+    exec_sql("UPDATE tournaments SET status='playing' WHERE id=?", (tournament_id,))
+    return created_matches, created_players
+
+
+
 def scan_tournament(tournament_id):
     tournament = q("SELECT * FROM tournaments WHERE id=?", (tournament_id,), one=True)
     if not tournament:
@@ -793,7 +885,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("♟️ Torneos de Ajedrez — V7 estable")
+st.title("♟️ Torneos de Ajedrez — V7.1")
 
 if not st.session_state.user:
     st.markdown('<div class="login-box">', unsafe_allow_html=True)
@@ -849,11 +941,84 @@ if current_user["must_change_password"]:
 
 menu = ["Torneos", "Mi perfil", "Ranking"]
 if is_staff(current_user):
-    menu = ["Torneos", "Importar fixture", "Admin usuarios", "Mi perfil", "Ranking"]
+    menu = ["Torneos", "Crear torneo", "Importar fixture", "Importar rondas", "Admin usuarios", "Mi perfil", "Ranking"]
 
 choice = st.sidebar.radio("Menú", menu)
 
-if choice == "Importar fixture":
+
+if choice == "Crear torneo":
+    st.header("Crear torneo vacío/manual")
+    st.write("Creá un torneo primero y después cargale rondas desde CSV en el menú **Importar rondas**.")
+
+    name = st.text_input("Nombre del torneo")
+    description = st.text_area("Descripción")
+
+    c1, c2, c3 = st.columns(3)
+    rules = "chess" if c1.selectbox("Modalidad", ["Ajedrez normal", "Chess960"], key="ct_rules") == "Ajedrez normal" else "chess960"
+    time_class = c2.selectbox("Clase", ["blitz", "rapid", "bullet", "daily"], key="ct_class")
+    time_control = c3.text_input("Ritmo exacto", value="600", key="ct_time")
+
+    rated_filter = {"Cualquiera": "any", "Solo rated": "rated", "Solo casual": "casual"}[
+        st.selectbox("Rated/Casual", ["Cualquiera", "Solo rated", "Solo casual"], key="ct_rated")
+    ]
+    strict_colors = st.checkbox("Respetar colores exactos", value=True, key="ct_strict")
+
+    if st.button("Crear torneo"):
+        if not name.strip():
+            st.warning("Poné un nombre.")
+        else:
+            tid = create_empty_tournament(
+                name.strip(),
+                description,
+                rules,
+                time_class,
+                time_control,
+                rated_filter,
+                strict_colors,
+                current_user["id"],
+            )
+            st.success(f"Torneo creado. ID: {tid}. Ahora podés ir a Importar rondas.")
+
+if choice == "Importar rondas":
+    st.header("Importar rondas a un torneo existente")
+    tournaments = q("SELECT id,name,time_class,time_control FROM tournaments ORDER BY id DESC")
+
+    if not tournaments:
+        st.info("Primero creá un torneo en el menú Crear torneo.")
+    else:
+        labels = {f"{t['name']} — {t['time_class']} — {t['time_control']}": t["id"] for t in tournaments}
+        selected = st.selectbox("Torneo destino", list(labels.keys()))
+        tournament_id = labels[selected]
+
+        st.write("Columnas requeridas: `ronda`, `fecha_inicio`, `fecha_fin`, `blancas_chesscom`, `negras_chesscom`.")
+
+        template = pd.DataFrame([{
+            "ronda": 1,
+            "fecha_inicio": "2026-02-27 00:00",
+            "fecha_fin": "2026-04-03 23:59",
+            "blancas_chesscom": "matiasbulacio",
+            "negras_chesscom": "juan123",
+        }])
+        st.download_button(
+            "Descargar plantilla de rondas",
+            template.to_csv(index=False).encode("utf-8"),
+            "rondas_fixture.csv",
+            "text/csv",
+        )
+
+        uploaded = st.file_uploader("Subir CSV de rondas", type=["csv"], key="rounds_csv")
+        if uploaded:
+            try:
+                df = read_uploaded_csv(uploaded)
+                st.dataframe(df, use_container_width=True)
+
+                if st.button("Importar rondas"):
+                    matches, players = import_rounds_to_existing_tournament(df, tournament_id)
+                    st.success(f"Rondas importadas. Cruces creados: {matches}. Jugadores nuevos: {players}.")
+            except Exception as exc:
+                st.error(exc)
+
+elif choice == "Importar fixture":
     st.header("Importar fixture pendiente")
     st.write("Columnas requeridas: `torneo`, `ronda`, `fecha_inicio`, `fecha_fin`, `blancas_chesscom`, `negras_chesscom`.")
 
