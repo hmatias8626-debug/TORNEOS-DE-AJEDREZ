@@ -10,7 +10,7 @@ from pathlib import Path
 APP_TITLE = "Torneos de Ajedrez"
 DB_PATH = Path("torneos_ajedrez.db")
 API_BASE = "https://api.chess.com/pub"
-HEADERS = {"User-Agent": "torneos-ajedrez-streamlit/6.1"}
+HEADERS = {"User-Agent": "torneos-ajedrez-streamlit/6.2"}
 DEFAULT_PASSWORD = "12345"
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
@@ -202,6 +202,10 @@ def init_db():
         ("tournaments", "pairing_mode_free", "TEXT DEFAULT 'random'"), ("tournaments", "strict_colors", "INTEGER DEFAULT 1"),
         ("tournaments", "swiss_rounds", "INTEGER DEFAULT 5"), ("tournaments", "pairing_mode_round1", "TEXT DEFAULT 'random'"),
         ("tournaments", "playoff_enabled", "INTEGER DEFAULT 1"), ("tournaments", "historical", "INTEGER DEFAULT 0"),
+        ("tournaments", "playoff_rules", "TEXT DEFAULT 'chess'"),
+        ("tournaments", "playoff_time_class", "TEXT DEFAULT 'blitz'"),
+        ("tournaments", "playoff_time_control", "TEXT DEFAULT '300'"),
+        ("tournaments", "playoff_rated_filter", "TEXT DEFAULT 'any'"),
         ("registrations", "status", "TEXT DEFAULT 'active'"), ("registrations", "wo_count", "INTEGER DEFAULT 0"), ("registrations", "created_by", "INTEGER"),
         ("matches", "locked", "INTEGER DEFAULT 0"), ("matches", "manual_pairing", "INTEGER DEFAULT 0"),
         ("matches", "bye", "INTEGER DEFAULT 0"), ("matches", "imported", "INTEGER DEFAULT 0"), ("matches", "result_type", "TEXT DEFAULT 'normal'"),
@@ -528,9 +532,11 @@ def add_match(tid, rid, white_id, black_id, manual=0, bye=0, status="pending", r
 
 def create_tournament(data, cups, windows, initial_players):
     tid = exec_sql("""
-        INSERT INTO tournaments(name,description,tournament_type,rules,time_class,time_control,rated_filter,swiss_rounds,free_fixture_games_per_player,pairing_mode_round1,pairing_mode_free,strict_colors,playoff_enabled,historical,created_by)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """, (data["name"], data["desc"], data["type"], data["rules"], data["time_class"], data["time_control"], data["rated_filter"], data["swiss_rounds"], data["free_games"], data["pairing_round1"], data["pairing_free"], 1 if data["strict_colors"] else 0, 1 if data["playoff"] else 0, data.get("historical",0), data["created_by"]))
+        INSERT INTO tournaments(name,description,tournament_type,rules,time_class,time_control,rated_filter,swiss_rounds,free_fixture_games_per_player,pairing_mode_round1,pairing_mode_free,strict_colors,playoff_enabled,historical,created_by,playoff_rules,playoff_time_class,playoff_time_control,playoff_rated_filter)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (data["name"], data["desc"], data["type"], data["rules"], data["time_class"], data["time_control"], data["rated_filter"], data["swiss_rounds"], data["free_games"], data["pairing_round1"], data["pairing_free"], 1 if data["strict_colors"] else 0, 1 if data["playoff"] else 0, data.get("historical",0), data["created_by"],
+        data.get("playoff_rules", data["rules"]), data.get("playoff_time_class", data["time_class"]),
+        data.get("playoff_time_control", data["time_control"]), data.get("playoff_rated_filter", data["rated_filter"])))
     for cup_name, start_rank, end_rank in cups:
         exec_sql("INSERT INTO playoff_cups(tournament_id,cup_name,start_rank,end_rank) VALUES(?,?,?,?)", (tid, cup_name, start_rank, end_rank))
     for rn, start_dt, end_dt in windows:
@@ -783,6 +789,30 @@ def read_uploaded_csv(file):
     raise Exception(f"No pude leer el CSV. Probá guardarlo como CSV UTF-8. Error: {last_error}")
 
 
+
+def update_tournament_settings(tid, rules, time_class, time_control, rated_filter, strict_colors, playoff_rules, playoff_time_class, playoff_time_control, playoff_rated_filter):
+    exec_sql("""
+        UPDATE tournaments
+        SET rules=?, time_class=?, time_control=?, rated_filter=?, strict_colors=?,
+            playoff_rules=?, playoff_time_class=?, playoff_time_control=?, playoff_rated_filter=?
+        WHERE id=?
+    """, (
+        rules, time_class, time_control, rated_filter, 1 if strict_colors else 0,
+        playoff_rules, playoff_time_class, playoff_time_control, playoff_rated_filter,
+        tid
+    ))
+
+def get_playoff_or_regular_config(t, is_playoff=False):
+    if is_playoff:
+        return {
+            "rules": t["playoff_rules"] or t["rules"],
+            "time_class": t["playoff_time_class"] or t["time_class"],
+            "time_control": t["playoff_time_control"] or t["time_control"],
+            "rated_filter": t["playoff_rated_filter"] or t["rated_filter"],
+            "strict_colors": t["strict_colors"],
+        }
+    return t
+
 def import_fixture_csv(df, created_by, default_rules="chess", default_time_class="blitz", default_time_control="300", default_rated_filter="any", strict_colors=True):
     required = {"torneo", "ronda", "fecha_inicio", "fecha_fin", "blancas_chesscom", "negras_chesscom"}
     missing = required - set(df.columns)
@@ -807,9 +837,9 @@ def import_fixture_csv(df, created_by, default_rules="chess", default_time_class
                 INSERT INTO tournaments(
                     name, description, status, tournament_type, rules, time_class, time_control,
                     rated_filter, swiss_rounds, pairing_mode_round1, strict_colors, playoff_enabled,
-                    historical, created_by
+                    historical, created_by, playoff_rules, playoff_time_class, playoff_time_control, playoff_rated_filter
                 )
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 torneo_name,
                 "Fixture pendiente importado para detección automática",
@@ -824,7 +854,11 @@ def import_fixture_csv(df, created_by, default_rules="chess", default_time_class
                 1 if strict_colors else 0,
                 0,
                 0,
-                created_by
+                created_by,
+                default_rules,
+                default_time_class,
+                default_time_control,
+                default_rated_filter
             ))
 
         for ronda, rg in group.groupby("ronda"):
@@ -906,7 +940,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("♟️ Torneos de Ajedrez — V6.1")
+st.title("♟️ Torneos de Ajedrez — V6.2")
 
 if not st.session_state.user:
     st.markdown('<div class="login-card">', unsafe_allow_html=True)
@@ -984,6 +1018,15 @@ if menu == "Crear torneo":
         rated = {"Cualquiera":"any", "Solo rated":"rated", "Solo casual":"casual"}[st.selectbox("Rated/Casual", ["Cualquiera", "Solo rated", "Solo casual"])]
         strict_colors = st.checkbox("Respetar colores exactos del fixture", value=True)
 
+        st.subheader("Tiempo de playoffs")
+        pc1, pc2, pc3 = st.columns(3)
+        playoff_rules = "chess" if pc1.selectbox("Modalidad playoffs", ["Ajedrez normal", "Chess960"], key="create_playoff_rules") == "Ajedrez normal" else "chess960"
+        playoff_time_class = pc2.selectbox("Clase playoffs", ["blitz", "rapid", "bullet", "daily"], key="create_playoff_time_class")
+        playoff_time_control = pc3.text_input("Ritmo playoffs", value=tcontrol, key="create_playoff_time_control", help="Ej: 300=5+0, 600=10+0, 180+2=3+2")
+        playoff_rated = {"Cualquiera":"any", "Solo rated":"rated", "Solo casual":"casual"}[
+            st.selectbox("Rated/Casual playoffs", ["Cualquiera", "Solo rated", "Solo casual"], key="create_playoff_rated")
+        ]
+
         swiss_rounds = 1
         free_games = 5
         pairing_round1 = "random"
@@ -1047,7 +1090,9 @@ if menu == "Crear torneo":
                     "name": name, "desc": desc, "type": tournament_type, "rules": rules, "time_class": tc,
                     "time_control": tcontrol, "rated_filter": rated, "swiss_rounds": int(swiss_rounds),
                     "free_games": int(free_games), "pairing_round1": pairing_round1, "pairing_free": pairing_free,
-                    "strict_colors": strict_colors, "playoff": playoff_enabled, "created_by": user["id"]
+                    "strict_colors": strict_colors, "playoff": playoff_enabled, "created_by": user["id"],
+                    "playoff_rules": playoff_rules, "playoff_time_class": playoff_time_class,
+                    "playoff_time_control": playoff_time_control, "playoff_rated_filter": playoff_rated
                 }, cups, windows, list(dict.fromkeys(initial_ids)))
                 st.success("Torneo creado con participantes iniciales.")
                 st.rerun()
@@ -1083,6 +1128,52 @@ elif menu == "Torneos":
             st.dataframe([dict(r) for r in regs], use_container_width=True)
 
             if can_manage_tournaments(user):
+                
+with st.expander("Modificar configuración del torneo"):
+                    st.caption("Esto cambia cómo el motor valida partidas futuras o pendientes. No modifica partidas ya detectadas/bloqueadas.")
+                    ec1, ec2, ec3 = st.columns(3)
+                    edit_rules = "chess" if ec1.selectbox("Modalidad fase regular", ["Ajedrez normal", "Chess960"], index=0 if t["rules"] == "chess" else 1, key=f"edit_rules_{t['id']}") == "Ajedrez normal" else "chess960"
+                    edit_time_class = ec2.selectbox("Clase fase regular", ["blitz", "rapid", "bullet", "daily"], index=["blitz","rapid","bullet","daily"].index(t["time_class"]) if t["time_class"] in ["blitz","rapid","bullet","daily"] else 0, key=f"edit_tc_{t['id']}")
+                    edit_time_control = ec3.text_input("Ritmo fase regular", value=str(t["time_control"]), key=f"edit_time_{t['id']}")
+
+                    edit_rated = {"Cualquiera":"any", "Solo rated":"rated", "Solo casual":"casual"}[
+                        st.selectbox(
+                            "Rated/Casual fase regular",
+                            ["Cualquiera", "Solo rated", "Solo casual"],
+                            index={"any":0,"rated":1,"casual":2}.get(t["rated_filter"],0),
+                            key=f"edit_rated_{t['id']}"
+                        )
+                    ]
+                    edit_strict = st.checkbox("Respetar colores exactos", value=bool(t["strict_colors"]), key=f"edit_strict_{t['id']}")
+
+                    st.markdown("**Playoffs**")
+                    pc1, pc2, pc3 = st.columns(3)
+                    pr_current = t["playoff_rules"] if "playoff_rules" in t.keys() and t["playoff_rules"] else t["rules"]
+                    ptc_current = t["playoff_time_class"] if "playoff_time_class" in t.keys() and t["playoff_time_class"] else t["time_class"]
+                    ptime_current = t["playoff_time_control"] if "playoff_time_control" in t.keys() and t["playoff_time_control"] else t["time_control"]
+                    prated_current = t["playoff_rated_filter"] if "playoff_rated_filter" in t.keys() and t["playoff_rated_filter"] else t["rated_filter"]
+
+                    edit_playoff_rules = "chess" if pc1.selectbox("Modalidad playoffs", ["Ajedrez normal", "Chess960"], index=0 if pr_current == "chess" else 1, key=f"edit_prules_{t['id']}") == "Ajedrez normal" else "chess960"
+                    edit_playoff_time_class = pc2.selectbox("Clase playoffs", ["blitz", "rapid", "bullet", "daily"], index=["blitz","rapid","bullet","daily"].index(ptc_current) if ptc_current in ["blitz","rapid","bullet","daily"] else 0, key=f"edit_ptc_{t['id']}")
+                    edit_playoff_time_control = pc3.text_input("Ritmo playoffs", value=str(ptime_current), key=f"edit_ptime_{t['id']}")
+                    edit_playoff_rated = {"Cualquiera":"any", "Solo rated":"rated", "Solo casual":"casual"}[
+                        st.selectbox(
+                            "Rated/Casual playoffs",
+                            ["Cualquiera", "Solo rated", "Solo casual"],
+                            index={"any":0,"rated":1,"casual":2}.get(prated_current,0),
+                            key=f"edit_prated_{t['id']}"
+                        )
+                    ]
+
+                    if st.button("Guardar configuración del torneo", key=f"save_config_{t['id']}"):
+                        update_tournament_settings(
+                            t["id"],
+                            edit_rules, edit_time_class, edit_time_control, edit_rated, edit_strict,
+                            edit_playoff_rules, edit_playoff_time_class, edit_playoff_time_control, edit_playoff_rated
+                        )
+                        st.success("Configuración actualizada.")
+                        st.rerun()
+
                 with st.expander("Administrar participantes"):
                     all_users = q("SELECT id, display_name, chesscom_user FROM users WHERE account_status!='suspended' ORDER BY display_name")
                     options = {f"{u['display_name']} ({u['chesscom_user']})": u["id"] for u in all_users}

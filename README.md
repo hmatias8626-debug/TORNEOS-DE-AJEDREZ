@@ -1,20 +1,16 @@
-# TORNEOS-DE-AJEDREZ V6.1
+# TORNEOS-DE-AJEDREZ V6.2
 
-Corrige lectura de CSV exportados desde Excel.
+Agrega:
+- Botón/panel para modificar configuración del torneo.
+- Permite cambiar tiempo de fase regular después de importar/crear torneo.
+- Permite configurar tiempo distinto para playoffs:
+  - modalidad playoffs
+  - clase playoffs
+  - ritmo playoffs
+  - rated/casual playoffs
 
-Ahora el importador intenta leer:
-- UTF-8
-- UTF-8-SIG
-- Latin-1
-- CP1252
+Uso:
+Torneos → Modificar configuración del torneo → Guardar configuración.
 
-y detecta separador:
-- coma
-- punto y coma
-- tabulación
-
-## Importar fixture pendiente
-
-Columnas requeridas:
-
-torneo,ronda,fecha_inicio,fecha_fin,blancas_chesscom,negras_chesscom
+Para tu caso:
+- fase regular: cambiar ritmo de 300 a 600.
