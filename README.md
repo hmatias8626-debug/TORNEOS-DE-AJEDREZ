@@ -1,37 +1,33 @@
-# TORNEOS-DE-AJEDREZ V4
+# TORNEOS-DE-AJEDREZ V5
 
-Agrega:
-- Importar torneos anteriores desde CSV.
-- Crear jugadores históricos automáticamente.
-- Vincular cuenta nueva con historial si coincide el usuario Chess.com.
-- Perfil más completo:
-  - ranking
-  - torneos jugados
-  - partidas jugadas
-  - G/E/P
-  - rendimiento
-  - historial
-  - historial ELO
+Cambios principales:
+- Login más compacto.
+- Modelo de perfiles por Chess.com:
+  - usuario = chesscom_user
+  - clave inicial = 12345
+  - estado pending/active/suspended
+  - al primer ingreso pasa a activo y debe cambiar contraseña.
+- Admin puede:
+  - crear jugadores rápidos con clave 12345
+  - resetear contraseña a 12345
+  - cambiar roles
+  - suspender usuarios
+  - agregar participantes a torneos aunque la inscripción esté cerrada
+  - quitar/descalificar/reactivar participantes de un torneo
 - Roles:
   - superadmin
   - admin
+  - moderator
   - player
-- Fixture libre y suizo.
-- Detección con colores estrictos y fechas/rondas.
-
-## CSV histórico
-
-Columnas requeridas:
-
-```text
-torneo,ronda,fecha,blancas_chesscom,negras_chesscom,resultado,link_chesscom
-```
-
-Resultados válidos:
-
-```text
-1-0
-0-1
-1/2-1/2
-0.5-0.5
-```
+- Al comenzar el torneo se cierra inscripción pública.
+- Staff puede agregar jugadores después de iniciado.
+- WO:
+  - si vence la ronda y no se detecta partida, se puede aplicar 0-0 WO
+  - ambos reciben advertencia WO
+  - al segundo WO quedan descalificados
+  - WO no modifica ELO
+- Mantiene:
+  - torneo suizo
+  - fixture libre
+  - importación histórica
+  - detección Chess.com por colores, ritmo, modalidad y rango de fechas.

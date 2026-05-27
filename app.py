@@ -10,7 +10,8 @@ from pathlib import Path
 APP_TITLE = "Torneos de Ajedrez"
 DB_PATH = Path("torneos_ajedrez.db")
 API_BASE = "https://api.chess.com/pub"
-HEADERS = {"User-Agent": "torneos-ajedrez-streamlit/4.0"}
+HEADERS = {"User-Agent": "torneos-ajedrez-streamlit/5.0"}
+DEFAULT_PASSWORD = "12345"
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 
@@ -73,6 +74,8 @@ def init_db():
         country TEXT,
         chess_title TEXT,
         chess_status TEXT,
+        account_status TEXT DEFAULT 'pending',
+        must_change_password INTEGER DEFAULT 1,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )
     """)
@@ -106,6 +109,9 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         tournament_id INTEGER NOT NULL,
         user_id INTEGER NOT NULL,
+        status TEXT DEFAULT 'active',
+        wo_count INTEGER DEFAULT 0,
+        created_by INTEGER,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(tournament_id, user_id)
     )
@@ -141,6 +147,7 @@ def init_db():
         black_user_id INTEGER,
         status TEXT DEFAULT 'pending',
         result TEXT,
+        result_type TEXT DEFAULT 'normal',
         chesscom_url TEXT,
         game_uuid TEXT,
         detected_at TEXT,
@@ -190,21 +197,42 @@ def init_db():
 
     for table, col, definition in [
         ("users", "avatar_url", "TEXT"), ("users", "country", "TEXT"), ("users", "chess_title", "TEXT"), ("users", "chess_status", "TEXT"),
+        ("users", "account_status", "TEXT DEFAULT 'pending'"), ("users", "must_change_password", "INTEGER DEFAULT 1"),
         ("tournaments", "tournament_type", "TEXT DEFAULT 'swiss'"), ("tournaments", "free_fixture_games_per_player", "INTEGER DEFAULT 5"),
         ("tournaments", "pairing_mode_free", "TEXT DEFAULT 'random'"), ("tournaments", "strict_colors", "INTEGER DEFAULT 1"),
         ("tournaments", "swiss_rounds", "INTEGER DEFAULT 5"), ("tournaments", "pairing_mode_round1", "TEXT DEFAULT 'random'"),
         ("tournaments", "playoff_enabled", "INTEGER DEFAULT 1"), ("tournaments", "historical", "INTEGER DEFAULT 0"),
+        ("registrations", "status", "TEXT DEFAULT 'active'"), ("registrations", "wo_count", "INTEGER DEFAULT 0"), ("registrations", "created_by", "INTEGER"),
         ("matches", "locked", "INTEGER DEFAULT 0"), ("matches", "manual_pairing", "INTEGER DEFAULT 0"),
-        ("matches", "bye", "INTEGER DEFAULT 0"), ("matches", "imported", "INTEGER DEFAULT 0"),
+        ("matches", "bye", "INTEGER DEFAULT 0"), ("matches", "imported", "INTEGER DEFAULT 0"), ("matches", "result_type", "TEXT DEFAULT 'normal'"),
     ]:
         ensure_column(table, col, definition)
 
 # =========================
-# CHESS.COM / USERS
+# HELPERS
 # =========================
 
 def norm(s):
     return (s or "").strip().lower()
+
+def hash_password(p):
+    return hashlib.sha256(p.encode("utf-8")).hexdigest()
+
+def is_superadmin(user):
+    return user and user["role"] == "superadmin"
+
+def is_staff(user):
+    return user and user["role"] in ("superadmin", "admin", "moderator")
+
+def can_manage_users(user):
+    return user and user["role"] in ("superadmin", "admin")
+
+def can_manage_tournaments(user):
+    return is_staff(user)
+
+def get_user(uid):
+    row = q("SELECT * FROM users WHERE id=?", (uid,), one=True)
+    return dict(row) if row else None
 
 def get_json(url):
     r = requests.get(url, headers=HEADERS, timeout=20)
@@ -245,36 +273,23 @@ def sync_chess_profile(user_id, chesscom_user):
     except Exception as e:
         return False, str(e)
 
-def hash_password(p):
-    return hashlib.sha256(p.encode("utf-8")).hexdigest()
-
-def is_superadmin(user):
-    return user and user["role"] == "superadmin"
-
-def is_admin(user):
-    return user and user["role"] in ("superadmin", "admin")
-
-def get_user(uid):
-    row = q("SELECT * FROM users WHERE id=?", (uid,), one=True)
-    return dict(row) if row else None
-
-def get_or_create_player_by_chess(chesscom_user, display_name=None):
+def get_or_create_player_by_chess(chesscom_user, display_name=None, created_by=None):
     chesscom_user = norm(chesscom_user)
     row = q("SELECT * FROM users WHERE chesscom_user=?", (chesscom_user,), one=True)
     if row:
         return dict(row)["id"], False
 
-    # Jugador histórico no reclamado: no puede iniciar sesión, pero conserva historial.
-    username = f"hist_{chesscom_user}"
+    # Nuevo modelo: usuario = Chess.com, clave inicial = 12345, perfil pendiente.
+    username = chesscom_user
     i = 1
     while q("SELECT id FROM users WHERE username=?", (username,), one=True):
         i += 1
-        username = f"hist_{chesscom_user}_{i}"
+        username = f"{chesscom_user}_{i}"
 
     uid = exec_sql("""
-        INSERT INTO users(username,password_hash,chesscom_user,display_name,role,elo)
-        VALUES(?,?,?,?,?,?)
-    """, (username, hash_password("NO_LOGIN_HISTORICO"), chesscom_user, display_name or chesscom_user, "player", 1200))
+        INSERT INTO users(username,password_hash,chesscom_user,display_name,role,elo,account_status,must_change_password)
+        VALUES(?,?,?,?,?,?,?,?)
+    """, (username, hash_password(DEFAULT_PASSWORD), chesscom_user, display_name or chesscom_user, "player", 1200, "pending", 1))
     sync_chess_profile(uid, chesscom_user)
     return uid, True
 
@@ -285,11 +300,12 @@ def create_user(username, password, chesscom_user, display_name):
     count = q("SELECT COUNT(*) c FROM users", one=True)["c"]
 
     existing = q("SELECT * FROM users WHERE chesscom_user=?", (chesscom_user,), one=True)
-    if existing and str(existing["username"]).startswith("hist_"):
+    if existing:
+        # Reclama perfil ya creado por admin/importación.
         role = "superadmin" if count == 0 else existing["role"]
         exec_sql("""
             UPDATE users
-            SET username=?, password_hash=?, display_name=?, role=?
+            SET username=?, password_hash=?, display_name=?, role=?, account_status='active', must_change_password=0
             WHERE id=?
         """, (username, hash_password(password), display_name, role, existing["id"]))
         sync_chess_profile(existing["id"], chesscom_user)
@@ -297,23 +313,32 @@ def create_user(username, password, chesscom_user, display_name):
 
     role = "superadmin" if count == 0 else "player"
     uid = exec_sql("""
-        INSERT INTO users(username,password_hash,chesscom_user,display_name,role)
-        VALUES(?,?,?,?,?)
-    """, (username, hash_password(password), chesscom_user, display_name, role))
+        INSERT INTO users(username,password_hash,chesscom_user,display_name,role,account_status,must_change_password)
+        VALUES(?,?,?,?,?,?,?)
+    """, (username, hash_password(password), chesscom_user, display_name, role, "active", 0))
     sync_chess_profile(uid, chesscom_user)
     return uid
 
 def login(username, password):
-    row = q("SELECT * FROM users WHERE username=?", (username.strip().lower(),), one=True)
-    if row and not str(row["username"]).startswith("hist_") and row["password_hash"] == hash_password(password):
-        return dict(row)
-    return None
+    username = norm(username)
+    row = q("SELECT * FROM users WHERE username=? OR chesscom_user=?", (username, username), one=True)
+    if not row:
+        return None, "Usuario no encontrado."
+    if row["account_status"] == "suspended":
+        return None, "Usuario suspendido."
+    if row["password_hash"] != hash_password(password):
+        return None, "Contraseña incorrecta."
+    if row["account_status"] == "pending":
+        exec_sql("UPDATE users SET account_status='active' WHERE id=?", (row["id"],))
+        row = q("SELECT * FROM users WHERE id=?", (row["id"],), one=True)
+    return dict(row), None
 
-def user_label(u):
-    return f"{u['display_name']} ({u['chesscom_user']})"
+def update_password(user_id, new_password, must_change=0):
+    exec_sql("UPDATE users SET password_hash=?, must_change_password=?, account_status='active' WHERE id=?",
+             (hash_password(new_password), must_change, user_id))
 
 # =========================
-# GAME VALIDATION / ELO
+# GAME / ELO
 # =========================
 
 def parse_ts(ts):
@@ -392,7 +417,7 @@ def score_from_result(result):
     return None
 
 # =========================
-# STATS
+# STATS / STANDINGS
 # =========================
 
 def player_stats(user_id):
@@ -401,11 +426,13 @@ def player_stats(user_id):
         WHERE status='finished' AND (white_user_id=? OR black_user_id=?)
     """, (user_id, user_id))
     pj = len(rows)
-    w = d = l = pts = 0
+    w = d = l = wo = pts = 0
     for m in rows:
-        if m["result"] == "BYE":
-            if m["white_user_id"] == user_id:
-                w += 1; pts += 1
+        if m["result_type"] == "wo":
+            wo += 1
+            continue
+        if m["result"] == "BYE" and m["white_user_id"] == user_id:
+            w += 1; pts += 1
             continue
         if m["white_user_id"] == user_id:
             if m["result"] == "1-0": w += 1; pts += 1
@@ -422,13 +449,13 @@ def player_stats(user_id):
     """, (user_id, user_id), one=True)["c"]
     rank_row = q("SELECT id FROM users ORDER BY elo DESC")
     rank = next((i for i, r in enumerate(rank_row, 1) if r["id"] == user_id), None)
-    return {"PJ": pj, "G": w, "E": d, "P": l, "Puntos": pts, "Rendimiento %": perf, "Torneos": tournaments, "Ranking": rank or "-"}
+    return {"PJ": pj, "G": w, "E": d, "P": l, "WO": wo, "Puntos": pts, "Rendimiento %": perf, "Torneos": tournaments, "Ranking": rank or "-"}
 
 def standings(tid):
     regs = q("""
-        SELECT u.id, u.display_name, u.chesscom_user, u.elo
+        SELECT u.id, u.display_name, u.chesscom_user, u.elo, r.status reg_status, r.wo_count
         FROM registrations r JOIN users u ON u.id=r.user_id
-        WHERE r.tournament_id=?
+        WHERE r.tournament_id=? AND r.status!='removed'
     """, (tid,))
     table = []
     for u in regs:
@@ -436,8 +463,11 @@ def standings(tid):
             SELECT * FROM matches WHERE tournament_id=? AND status='finished'
             AND (white_user_id=? OR black_user_id=?)
         """, (tid, u["id"], u["id"]))
-        pts = w = d = l = 0
+        pts = w = d = l = wo = 0
         for m in rows:
+            if m["result_type"] == "wo":
+                wo += 1
+                continue
             if m["result"] == "BYE" and m["white_user_id"] == u["id"]:
                 pts += 1; w += 1
             elif m["white_user_id"] == u["id"]:
@@ -448,14 +478,17 @@ def standings(tid):
                 if m["result"] == "0-1": pts += 1; w += 1
                 elif m["result"] == "1-0": l += 1
                 elif m["result"] == "1/2-1/2": pts += 0.5; d += 1
-        table.append({"Rank": 0, "User ID": u["id"], "Jugador": u["display_name"], "Chess.com": u["chesscom_user"], "ELO": u["elo"], "PJ": len(rows), "G": w, "E": d, "P": l, "Puntos": pts})
-    table.sort(key=lambda x: (x["Puntos"], x["ELO"], x["G"]), reverse=True)
+        table.append({
+            "Rank": 0, "User ID": u["id"], "Jugador": u["display_name"], "Chess.com": u["chesscom_user"], "ELO": u["elo"],
+            "PJ": len(rows), "G": w, "E": d, "P": l, "WO": u["wo_count"], "Estado": u["reg_status"], "Puntos": pts
+        })
+    table.sort(key=lambda x: (x["Estado"] != "disqualified", x["Puntos"], x["ELO"], x["G"]), reverse=True)
     for i, r in enumerate(table, 1):
         r["Rank"] = i
     return table
 
 # =========================
-# TOURNAMENT
+# TOURNAMENT LOGIC
 # =========================
 
 def round_window(tid, rn):
@@ -468,25 +501,32 @@ def current_round_number(tid):
     row = q("SELECT MAX(number) n FROM rounds WHERE tournament_id=?", (tid,), one=True)
     return row["n"] if row and row["n"] else 0
 
-def registered_players(tid):
-    return q("""
-        SELECT u.* FROM registrations r JOIN users u ON u.id=r.user_id
-        WHERE r.tournament_id=? ORDER BY u.elo DESC, u.display_name
+def registered_players(tid, only_active=True):
+    status_filter = "AND r.status='active'" if only_active else "AND r.status!='removed'"
+    return q(f"""
+        SELECT u.*, r.status reg_status, r.wo_count FROM registrations r JOIN users u ON u.id=r.user_id
+        WHERE r.tournament_id=? {status_filter} ORDER BY u.elo DESC, u.display_name
     """, (tid,))
+
+def register_player(tid, user_id, created_by=None):
+    exec_sql("""
+        INSERT OR IGNORE INTO registrations(tournament_id,user_id,status,wo_count,created_by)
+        VALUES(?,?,?,?,?)
+    """, (tid, user_id, "active", 0, created_by))
 
 def create_round(tid, rn):
     start, _ = round_window(tid, rn)
-    rid = exec_sql("INSERT INTO rounds(tournament_id,number,status,started_at) VALUES(?,?,?,?)", (tid, rn, "active", start.isoformat(timespec="seconds")))
+    rid = exec_sql("INSERT INTO rounds(tournament_id,number,status,started_at) VALUES(?,?,?,?)", (tid, rn, "active", start.isoformat(timespec="seconds") if start else dt.datetime.now().isoformat(timespec="seconds")))
     exec_sql("UPDATE tournaments SET status='playing' WHERE id=?", (tid,))
     return rid
 
-def add_match(tid, rid, white_id, black_id, manual=0, bye=0, status="pending", result=None, imported=0):
+def add_match(tid, rid, white_id, black_id, manual=0, bye=0, status="pending", result=None, imported=0, result_type="normal"):
     return exec_sql("""
-        INSERT INTO matches(tournament_id,round_id,white_user_id,black_user_id,manual_pairing,bye,status,result,locked,imported)
-        VALUES(?,?,?,?,?,?,?,?,?,?)
-    """, (tid, rid, white_id, black_id, manual, bye, status, result, 1 if status == "finished" else 0, imported))
+        INSERT INTO matches(tournament_id,round_id,white_user_id,black_user_id,manual_pairing,bye,status,result,locked,imported,result_type)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?)
+    """, (tid, rid, white_id, black_id, manual, bye, status, result, 1 if status == "finished" else 0, imported, result_type))
 
-def create_tournament(data, cups, windows):
+def create_tournament(data, cups, windows, initial_players):
     tid = exec_sql("""
         INSERT INTO tournaments(name,description,tournament_type,rules,time_class,time_control,rated_filter,swiss_rounds,free_fixture_games_per_player,pairing_mode_round1,pairing_mode_free,strict_colors,playoff_enabled,historical,created_by)
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
@@ -495,15 +535,17 @@ def create_tournament(data, cups, windows):
         exec_sql("INSERT INTO playoff_cups(tournament_id,cup_name,start_rank,end_rank) VALUES(?,?,?,?)", (tid, cup_name, start_rank, end_rank))
     for rn, start_dt, end_dt in windows:
         exec_sql("INSERT INTO round_windows(tournament_id,round_number,start_datetime,end_datetime) VALUES(?,?,?,?)", (tid, rn, start_dt, end_dt))
+    for uid in initial_players:
+        register_player(tid, uid, data["created_by"])
     return tid
 
 def generate_free_fixture(tid):
     t = q("SELECT * FROM tournaments WHERE id=?", (tid,), one=True)
     if current_round_number(tid) > 0:
         raise Exception("Este torneo ya tiene fixture generado.")
-    players = list(registered_players(tid))
+    players = list(registered_players(tid, only_active=True))
     if len(players) < 2:
-        raise Exception("Necesitás al menos 2 jugadores.")
+        raise Exception("Necesitás al menos 2 jugadores activos.")
     games_per_player = int(t["free_fixture_games_per_player"])
     rid = create_round(tid, 1)
     ids = [p["id"] for p in players]
@@ -525,9 +567,9 @@ def generate_free_fixture(tid):
 def generate_round_one_auto(tid):
     if current_round_number(tid) > 0:
         raise Exception("Este torneo ya tiene rondas.")
-    players = list(registered_players(tid))
+    players = list(registered_players(tid, only_active=True))
     if len(players) < 2:
-        raise Exception("Necesitás al menos 2 jugadores.")
+        raise Exception("Necesitás al menos 2 jugadores activos.")
     t = q("SELECT * FROM tournaments WHERE id=?", (tid,), one=True)
     rid = create_round(tid, 1)
     if t["pairing_mode_round1"] == "elo":
@@ -544,6 +586,60 @@ def generate_round_one_auto(tid):
     if bye:
         add_match(tid, rid, bye["id"], None, bye=1, status="finished", result="BYE")
 
+def generate_next_swiss_round(tid):
+    t = q("SELECT * FROM tournaments WHERE id=?", (tid,), one=True)
+    rn = current_round_number(tid) + 1
+    if rn > int(t["swiss_rounds"]):
+        raise Exception("Ya se generaron todas las rondas suizas.")
+    if rn == 1:
+        return generate_round_one_auto(tid)
+
+    prev = q("SELECT id FROM rounds WHERE tournament_id=? AND number=?", (tid, rn-1), one=True)
+    if prev:
+        pending = q("SELECT COUNT(*) c FROM matches WHERE round_id=? AND status!='finished'", (prev["id"],), one=True)["c"]
+        if pending:
+            raise Exception("Hay partidas pendientes en la ronda anterior.")
+
+    table = [r for r in standings(tid) if r["Estado"] == "active"]
+    ids = [r["User ID"] for r in table]
+    paired = set()
+    pairs = []
+    bye = None
+
+    prev_pairs = q("SELECT white_user_id, black_user_id FROM matches WHERE tournament_id=? AND black_user_id IS NOT NULL", (tid,))
+    met = set()
+    for p in prev_pairs:
+        met.add(tuple(sorted([p["white_user_id"], p["black_user_id"]])))
+
+    for uid in ids:
+        if uid in paired:
+            continue
+        candidate = None
+        for other in ids:
+            if other == uid or other in paired:
+                continue
+            if tuple(sorted([uid, other])) not in met:
+                candidate = other
+                break
+        if candidate is None:
+            for other in ids:
+                if other != uid and other not in paired:
+                    candidate = other
+                    break
+        if candidate:
+            pairs.append((uid, candidate))
+            paired.add(uid); paired.add(candidate)
+        else:
+            bye = uid
+            paired.add(uid)
+
+    rid = create_round(tid, rn)
+    for a,b in pairs:
+        w, bl = (a,b) if random.choice([True,False]) else (b,a)
+        add_match(tid, rid, w, bl)
+    if bye:
+        add_match(tid, rid, bye, None, bye=1, status="finished", result="BYE")
+
 def apply_match_result(match, game, wu, bu):
     fresh = q("SELECT * FROM matches WHERE id=?", (match["id"],), one=True)
     if fresh["status"] == "finished" or fresh["locked"]:
@@ -552,7 +648,7 @@ def apply_match_result(match, game, wu, bu):
     if white_score is None:
         return False
     result = "1-0" if white_score == 1 else "0-1" if white_score == 0 else "1/2-1/2"
-    exec_sql("UPDATE matches SET status='finished', result=?, chesscom_url=?, game_uuid=?, detected_at=?, locked=1 WHERE id=?",
+    exec_sql("UPDATE matches SET status='finished', result=?, result_type='normal', chesscom_url=?, game_uuid=?, detected_at=?, locked=1 WHERE id=?",
              (result, game.get("url"), game.get("uuid"), dt.datetime.now().isoformat(timespec="seconds"), match["id"]))
     apply_elo(match["id"], wu["id"], bu["id"], white_score)
     return True
@@ -579,6 +675,34 @@ def scan_tournament(tid):
             errors.append(f"{wu['chesscom_user']} vs {bu['chesscom_user']}: {e}")
     return found, errors
 
+def apply_wo_for_expired_matches(tid, admin_user_id):
+    now = dt.datetime.now()
+    matches = q("""
+        SELECT m.*, IFNULL(r.number,1) round_number
+        FROM matches m LEFT JOIN rounds r ON r.id=m.round_id
+        WHERE m.tournament_id=? AND m.status!='finished' AND IFNULL(m.locked,0)=0 AND m.black_user_id IS NOT NULL
+    """, (tid,))
+    applied = 0
+    disqualified = []
+    for m in matches:
+        _, end_dt = round_window(tid, m["round_number"])
+        if end_dt and now > end_dt:
+            exec_sql("""
+                UPDATE matches
+                SET status='finished', result='0-0 WO', result_type='wo', detected_at=?, locked=1
+                WHERE id=?
+            """, (now.isoformat(timespec="seconds"), m["id"]))
+            for uid in [m["white_user_id"], m["black_user_id"]]:
+                exec_sql("UPDATE registrations SET wo_count=IFNULL(wo_count,0)+1 WHERE tournament_id=? AND user_id=?", (tid, uid))
+                reg = q("SELECT wo_count FROM registrations WHERE tournament_id=? AND user_id=?", (tid, uid), one=True)
+                if reg and reg["wo_count"] >= 2:
+                    exec_sql("UPDATE registrations SET status='disqualified' WHERE tournament_id=? AND user_id=?", (tid, uid))
+                    disqualified.append(uid)
+            exec_sql("INSERT INTO admin_audit(match_id,admin_user_id,old_result,new_result,reason) VALUES(?,?,?,?,?)",
+                     (m["id"], admin_user_id, None, "0-0 WO", "WO automático por vencimiento de ronda"))
+            applied += 1
+    return applied, disqualified
+
 def import_history_csv(df, created_by):
     required = {"torneo","ronda","fecha","blancas_chesscom","negras_chesscom","resultado"}
     missing = required - set(df.columns)
@@ -600,7 +724,7 @@ def import_history_csv(df, created_by):
                 "swiss_rounds": int(group["ronda"].max()) if "ronda" in group else 1,
                 "free_games": 0, "pairing_round1": "manual", "pairing_free": "manual",
                 "strict_colors": True, "playoff": False, "historical": 1, "created_by": created_by
-            }, [], [(1, start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds"))])
+            }, [], [(1, start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds"))], [])
 
         for _, row in group.iterrows():
             ronda = int(row.get("ronda", 1))
@@ -610,17 +734,14 @@ def import_history_csv(df, created_by):
             else:
                 rid = r["id"]
 
-            w_id, _ = get_or_create_player_by_chess(row["blancas_chesscom"])
-            b_id, _ = get_or_create_player_by_chess(row["negras_chesscom"])
+            w_id, _ = get_or_create_player_by_chess(row["blancas_chesscom"], created_by=created_by)
+            b_id, _ = get_or_create_player_by_chess(row["negras_chesscom"], created_by=created_by)
 
-            try:
-                exec_sql("INSERT OR IGNORE INTO registrations(tournament_id,user_id) VALUES(?,?)", (tid, w_id))
-                exec_sql("INSERT OR IGNORE INTO registrations(tournament_id,user_id) VALUES(?,?)", (tid, b_id))
-            except Exception:
-                pass
+            register_player(tid, w_id, created_by)
+            register_player(tid, b_id, created_by)
 
             result = str(row["resultado"]).strip()
-            if result == "0.5-0.5" or result == "½-½":
+            if result in ("0.5-0.5", "½-½"):
                 result = "1/2-1/2"
             if score_from_result(result) is None:
                 continue
@@ -647,37 +768,55 @@ init_db()
 if "user" not in st.session_state:
     st.session_state.user = None
 
-st.title("♟️ Torneos de Ajedrez — V4")
+st.markdown("""
+<style>
+.main .block-container {max-width: 1200px;}
+.login-card {
+    max-width: 430px;
+    margin: 0 auto;
+    padding: 1.4rem 1.6rem;
+    border: 1px solid rgba(128,128,128,.25);
+    border-radius: 18px;
+}
+</style>
+""", unsafe_allow_html=True)
+
+st.title("♟️ Torneos de Ajedrez — V5")
 
 if not st.session_state.user:
-    tab_login, tab_reg = st.tabs(["Ingresar", "Registrarme"])
+    st.markdown('<div class="login-card">', unsafe_allow_html=True)
+    tab_login, tab_reg = st.tabs(["Ingresar", "Crear cuenta"])
     with tab_login:
-        u = st.text_input("Usuario", key="login_user")
+        st.caption("Usá tu usuario de Chess.com. Si tu perfil fue cargado por admin, la clave inicial es 12345.")
+        u = st.text_input("Usuario Chess.com", key="login_user")
         p = st.text_input("Contraseña", type="password", key="login_pass")
-        if st.button("Ingresar"):
-            user = login(u, p)
+        if st.button("Ingresar", use_container_width=True):
+            user, err = login(u, p)
             if user:
                 st.session_state.user = user
                 st.rerun()
             else:
-                st.error("Usuario o contraseña incorrectos.")
+                st.error(err or "No pude ingresar.")
     with tab_reg:
+        st.caption("También podés crear/reclamar tu perfil.")
         nu = st.text_input("Usuario para la app", key="reg_user")
         nd = st.text_input("Nombre visible", key="reg_name")
         nc = st.text_input("Usuario de Chess.com", key="reg_chess")
         np = st.text_input("Contraseña", type="password", key="reg_pass")
-        if st.button("Registrarme"):
+        if st.button("Registrarme", use_container_width=True):
             try:
                 if not nu or not np or not nc:
                     st.warning("Completá usuario, contraseña y usuario Chess.com.")
                 else:
                     create_user(nu, np, nc, nd)
-                    st.success("Usuario creado o vinculado con historial previo. Ahora ingresá.")
+                    st.success("Usuario creado o vinculado. Ahora ingresá.")
             except Exception as e:
                 st.error(f"No pude crear/vincular el usuario: {e}")
+    st.markdown('</div>', unsafe_allow_html=True)
     st.stop()
 
 user = get_user(st.session_state.user["id"])
+
 st.sidebar.success(f"{user['display_name']} | {user['role']} | ELO {user['elo']}")
 if user["avatar_url"]:
     st.sidebar.image(user["avatar_url"], width=100)
@@ -685,15 +824,30 @@ if st.sidebar.button("Cerrar sesión"):
     st.session_state.user = None
     st.rerun()
 
+if user["must_change_password"]:
+    st.warning("Tu contraseña es temporal. Cambiala para continuar usando el perfil con seguridad.")
+    with st.form("force_password"):
+        n1 = st.text_input("Nueva contraseña", type="password")
+        n2 = st.text_input("Repetir nueva contraseña", type="password")
+        ok = st.form_submit_button("Cambiar contraseña")
+        if ok:
+            if not n1 or n1 != n2:
+                st.error("Las contraseñas no coinciden.")
+            else:
+                update_password(user["id"], n1, must_change=0)
+                st.success("Contraseña actualizada.")
+                st.rerun()
+    st.stop()
+
 menus = ["Torneos", "Crear torneo", "Mi perfil", "Ranking general"]
-if is_admin(user):
+if is_staff(user):
     menus += ["Importar historial", "Admin usuarios"]
 menu = st.sidebar.radio("Menú", menus)
 
 if menu == "Crear torneo":
     st.header("Crear torneo")
-    if not is_admin(user):
-        st.warning("Solo admin o superadmin puede crear torneos.")
+    if not can_manage_tournaments(user):
+        st.warning("Solo staff puede crear torneos.")
     else:
         name = st.text_input("Nombre del torneo")
         desc = st.text_area("Descripción")
@@ -748,17 +902,29 @@ if menu == "Crear torneo":
                 cups.append((cup_name, next_rank, next_rank+int(size)-1))
                 next_rank += int(size)
 
+        st.subheader("Participantes iniciales")
+        all_users = q("SELECT id, display_name, chesscom_user FROM users WHERE account_status!='suspended' ORDER BY display_name")
+        options = {f"{u['display_name']} ({u['chesscom_user']})": u["id"] for u in all_users}
+        selected_players = st.multiselect("Seleccionar jugadores ya cargados", list(options.keys()))
+        new_players_txt = st.text_area("Agregar jugadores nuevos por usuario Chess.com, uno por línea", help="Ejemplo:\nmatiasbulacio\njuan123\npedro456")
+
         if st.button("Crear torneo"):
             if not name:
                 st.warning("Poné un nombre.")
             else:
-                create_tournament({
+                initial_ids = [options[x] for x in selected_players]
+                for line in new_players_txt.splitlines():
+                    ch = norm(line)
+                    if ch:
+                        uid, _ = get_or_create_player_by_chess(ch, created_by=user["id"])
+                        initial_ids.append(uid)
+                tid = create_tournament({
                     "name": name, "desc": desc, "type": tournament_type, "rules": rules, "time_class": tc,
                     "time_control": tcontrol, "rated_filter": rated, "swiss_rounds": int(swiss_rounds),
                     "free_games": int(free_games), "pairing_round1": pairing_round1, "pairing_free": pairing_free,
                     "strict_colors": strict_colors, "playoff": playoff_enabled, "created_by": user["id"]
-                }, cups, windows)
-                st.success("Torneo creado.")
+                }, cups, windows, list(dict.fromkeys(initial_ids)))
+                st.success("Torneo creado con participantes iniciales.")
                 st.rerun()
 
 elif menu == "Torneos":
@@ -768,45 +934,83 @@ elif menu == "Torneos":
         with st.expander(f"{t['name']} — {t['status']} — {t['tournament_type']} — {t['time_control']}", expanded=True):
             st.write(t["description"] or "")
             regs = q("""
-                SELECT u.display_name, u.chesscom_user, u.elo FROM registrations r
-                JOIN users u ON u.id=r.user_id WHERE r.tournament_id=? ORDER BY u.elo DESC
+                SELECT u.id, u.display_name, u.chesscom_user, u.elo, r.status, r.wo_count FROM registrations r
+                JOIN users u ON u.id=r.user_id WHERE r.tournament_id=? AND r.status!='removed' ORDER BY r.status, u.elo DESC
             """, (t["id"],))
-            already = q("SELECT * FROM registrations WHERE tournament_id=? AND user_id=?", (t["id"], user["id"]), one=True)
-            c1,c2,c3,c4 = st.columns(4)
-            c1.metric("Inscriptos", len(regs)); c2.metric("Tipo", "Fixture libre" if t["tournament_type"] == "free_fixture" else "Suizo")
-            c3.metric("Colores estrictos", "Sí" if t["strict_colors"] else "No"); c4.metric("Ritmo", t["time_control"])
+            already = q("SELECT * FROM registrations WHERE tournament_id=? AND user_id=? AND status!='removed'", (t["id"], user["id"]), one=True)
+            c1,c2,c3,c4,c5 = st.columns(5)
+            c1.metric("Inscriptos", len(regs))
+            c2.metric("Tipo", "Fixture libre" if t["tournament_type"] == "free_fixture" else "Suizo")
+            c3.metric("Estado", t["status"])
+            c4.metric("Ritmo", t["time_control"])
+            c5.metric("Colores", "Exactos" if t["strict_colors"] else "Flexibles")
 
             if t["status"] == "open":
                 if already:
                     st.success("Ya estás inscripto.")
                 elif st.button(f"Inscribirme en {t['name']}", key=f"reg_{t['id']}"):
-                    exec_sql("INSERT INTO registrations(tournament_id,user_id) VALUES(?,?)", (t["id"], user["id"]))
+                    register_player(t["id"], user["id"], user["id"])
                     st.rerun()
+            else:
+                st.info("Inscripción cerrada. Solo staff puede agregar/quitar jugadores.")
 
             st.write("**Inscriptos:**")
             st.dataframe([dict(r) for r in regs], use_container_width=True)
 
-            if is_admin(user):
-                a,b,c = st.columns(3)
+            if can_manage_tournaments(user):
+                with st.expander("Administrar participantes"):
+                    all_users = q("SELECT id, display_name, chesscom_user FROM users WHERE account_status!='suspended' ORDER BY display_name")
+                    options = {f"{u['display_name']} ({u['chesscom_user']})": u["id"] for u in all_users}
+                    add_sel = st.multiselect("Agregar participantes al torneo", list(options.keys()), key=f"addp_{t['id']}")
+                    add_txt = st.text_area("O agregar por usuario Chess.com, uno por línea", key=f"addtxt_{t['id']}")
+                    if st.button("Agregar participantes", key=f"addbtn_{t['id']}"):
+                        ids = [options[x] for x in add_sel]
+                        for line in add_txt.splitlines():
+                            ch = norm(line)
+                            if ch:
+                                uid, _ = get_or_create_player_by_chess(ch, created_by=user["id"])
+                                ids.append(uid)
+                        for uid in ids:
+                            register_player(t["id"], uid, user["id"])
+                        st.success("Participantes agregados.")
+                        st.rerun()
+
+                    remove_options = {f"{r['display_name']} ({r['chesscom_user']}) - {r['status']}": r["id"] for r in regs}
+                    rem = st.selectbox("Quitar / descalificar participante", [""] + list(remove_options.keys()), key=f"rem_{t['id']}")
+                    action = st.selectbox("Acción", ["removed", "disqualified", "active"], format_func=lambda x: {"removed":"Quitar del torneo", "disqualified":"Descalificar", "active":"Reactivar"}[x], key=f"act_{t['id']}")
+                    if rem and st.button("Aplicar acción", key=f"rembtn_{t['id']}"):
+                        exec_sql("UPDATE registrations SET status=? WHERE tournament_id=? AND user_id=?", (action, t["id"], remove_options[rem]))
+                        st.success("Estado actualizado.")
+                        st.rerun()
+
+                a,b,c,d = st.columns(4)
                 if t["tournament_type"] == "free_fixture":
                     if a.button("Generar fixture libre", key=f"free_{t['id']}"):
                         try:
-                            generate_free_fixture(t["id"]); st.success("Fixture generado."); st.rerun()
+                            generate_free_fixture(t["id"]); st.success("Fixture generado. Inscripción cerrada."); st.rerun()
                         except Exception as e: st.error(e)
                 else:
-                    if a.button("Generar ronda 1 auto", key=f"gen_{t['id']}"):
+                    if a.button("Generar ronda 1", key=f"gen_{t['id']}"):
                         try:
-                            generate_round_one_auto(t["id"]); st.success("Ronda 1 generada."); st.rerun()
+                            generate_round_one_auto(t["id"]); st.success("Ronda 1 generada. Inscripción cerrada."); st.rerun()
                         except Exception as e: st.error(e)
-                if b.button("Buscar resultados Chess.com", key=f"scan_{t['id']}"):
+
+                if b.button("Generar siguiente suiza", key=f"next_{t['id']}"):
+                    try:
+                        generate_next_swiss_round(t["id"]); st.success("Siguiente ronda generada."); st.rerun()
+                    except Exception as e: st.error(e)
+
+                if c.button("Buscar resultados Chess.com", key=f"scan_{t['id']}"):
                     with st.spinner("Buscando partidas válidas..."):
                         found, errors = scan_tournament(t["id"])
                     st.success(f"Detectadas: {len(found)}") if found else st.info("No se detectaron partidas nuevas.")
                     for e in errors: st.warning(e)
                     st.rerun()
-                if c.button("Cancelar torneo", key=f"del_{t['id']}"):
-                    exec_sql("UPDATE tournaments SET status='cancelled' WHERE id=?", (t["id"],))
-                    st.warning("Torneo cancelado."); st.rerun()
+
+                if d.button("Aplicar WO vencidos", key=f"wo_{t['id']}"):
+                    applied, disq = apply_wo_for_expired_matches(t["id"], user["id"])
+                    st.warning(f"WO aplicados: {applied}. Descalificados nuevos: {len(set(disq))}")
+                    st.rerun()
 
             st.write("**Rangos válidos:**")
             wins = q("SELECT round_number, start_datetime, end_datetime FROM round_windows WHERE tournament_id=? ORDER BY round_number", (t["id"],))
@@ -825,7 +1029,7 @@ elif menu == "Torneos":
             st.dataframe([{
                 "Fecha/Ronda": m["round_number"], "Blancas": m["white_name"], "Chess blancas": m["white_chess"],
                 "Negras": m["black_name"] or "BYE", "Chess negras": m["black_chess"] or "",
-                "Estado": m["status"], "Bloqueada": "Sí" if m["locked"] else "No", "Importada": "Sí" if m["imported"] else "No",
+                "Estado": m["status"], "Tipo": m["result_type"], "Bloqueada": "Sí" if m["locked"] else "No",
                 "Resultado": m["result"] or "", "Link": m["chesscom_url"] or ""
             } for m in matches], use_container_width=True)
 
@@ -843,14 +1047,31 @@ elif menu == "Mi perfil":
     c2.write(f"**Nombre:** {user['display_name']}")
     c2.write(f"**Chess.com:** {user['chesscom_user']}")
     c2.write(f"**Rol:** {user['role']}")
+    c2.write(f"**Estado:** {user['account_status']}")
     if st.button("Sincronizar perfil con Chess.com"):
         ok, msg = sync_chess_profile(user["id"], user["chesscom_user"])
         st.success(msg) if ok else st.error(msg); st.rerun()
 
+    st.subheader("Cambiar contraseña")
+    with st.form("change_pass"):
+        old = st.text_input("Contraseña actual", type="password")
+        n1 = st.text_input("Nueva contraseña", type="password")
+        n2 = st.text_input("Repetir nueva contraseña", type="password")
+        ok = st.form_submit_button("Cambiar")
+        if ok:
+            fresh = get_user(user["id"])
+            if fresh["password_hash"] != hash_password(old):
+                st.error("Contraseña actual incorrecta.")
+            elif not n1 or n1 != n2:
+                st.error("Las nuevas contraseñas no coinciden.")
+            else:
+                update_password(user["id"], n1, must_change=0)
+                st.success("Contraseña actualizada.")
+
     st.subheader("Estadísticas")
-    c1,c2,c3,c4,c5,c6,c7 = st.columns(7)
+    c1,c2,c3,c4,c5,c6,c7,c8 = st.columns(8)
     c1.metric("Ranking", stats["Ranking"]); c2.metric("Torneos", stats["Torneos"]); c3.metric("PJ", stats["PJ"])
-    c4.metric("G", stats["G"]); c5.metric("E", stats["E"]); c6.metric("P", stats["P"]); c7.metric("Rend.", f"{stats['Rendimiento %']}%")
+    c4.metric("G", stats["G"]); c5.metric("E", stats["E"]); c6.metric("P", stats["P"]); c7.metric("WO", stats["WO"]); c8.metric("Rend.", f"{stats['Rendimiento %']}%")
 
     matches = q("""
         SELECT m.*, t.name tournament_name, IFNULL(r.number,1) round_number,
@@ -865,20 +1086,15 @@ elif menu == "Mi perfil":
     st.subheader("Historial de partidas")
     st.dataframe([{
         "Torneo": m["tournament_name"], "Fecha/Ronda": m["round_number"], "Blancas": m["white_name"],
-        "Negras": m["black_name"] or "BYE", "Resultado": m["result"], "Importada": "Sí" if m["imported"] else "No",
-        "Link": m["chesscom_url"] or ""
+        "Negras": m["black_name"] or "BYE", "Resultado": m["result"], "Tipo": m["result_type"], "Link": m["chesscom_url"] or ""
     } for m in matches], use_container_width=True)
-
-    elo = q("SELECT old_elo,new_elo,delta,created_at FROM elo_history WHERE user_id=? ORDER BY id DESC", (user["id"],))
-    st.subheader("Historial ELO")
-    st.dataframe([dict(e) for e in elo], use_container_width=True)
 
 elif menu == "Ranking general":
     st.header("Ranking general")
-    users = q("SELECT id,display_name,chesscom_user,elo,role,username FROM users ORDER BY elo DESC")
+    users = q("SELECT id,display_name,chesscom_user,elo,role,username,account_status,must_change_password FROM users ORDER BY elo DESC")
     st.dataframe([{
         "Nombre": u["display_name"], "Chess.com": u["chesscom_user"], "ELO": u["elo"], "Rol": u["role"],
-        "Perfil reclamado": "No" if str(u["username"]).startswith("hist_") else "Sí"
+        "Estado": u["account_status"], "Clave temporal": "Sí" if u["must_change_password"] else "No"
     } for u in users], use_container_width=True)
 
 elif menu == "Importar historial":
@@ -895,7 +1111,7 @@ elif menu == "Importar historial":
         if st.button("Importar historial"):
             try:
                 n = import_history_csv(df, user["id"])
-                st.success(f"Partidas importadas: {n}. Jugadores históricos creados/vinculados automáticamente.")
+                st.success(f"Partidas importadas: {n}. Jugadores creados con usuario Chess.com y clave inicial 12345.")
             except Exception as e:
                 st.error(e)
 
@@ -904,28 +1120,47 @@ elif menu == "Admin usuarios":
     users = q("SELECT * FROM users ORDER BY role DESC, elo DESC, display_name")
     st.dataframe([{
         "ID": u["id"], "Nombre": u["display_name"], "Usuario": u["username"], "Chess.com": u["chesscom_user"],
-        "Rol": u["role"], "ELO": u["elo"], "Reclamado": "No" if str(u["username"]).startswith("hist_") else "Sí"
+        "Rol": u["role"], "ELO": u["elo"], "Estado": u["account_status"], "Clave temporal": "Sí" if u["must_change_password"] else "No"
     } for u in users], use_container_width=True)
 
-    labels = {f"{u['display_name']} ({u['username']})": u["id"] for u in users}
-    st.subheader("Cambiar rol")
-    selected = st.selectbox("Usuario", list(labels.keys()))
-    target = get_user(labels[selected])
-    allowed_roles = ["player", "admin", "superadmin"] if is_superadmin(user) else ["player", "admin"]
-    new_role = st.selectbox("Nuevo rol", allowed_roles, index=allowed_roles.index(target["role"]) if target["role"] in allowed_roles else 0)
-    if st.button("Actualizar rol"):
-        if target["id"] == user["id"] and user["role"] == "superadmin" and new_role != "superadmin":
-            st.error("No te podés quitar superadmin a vos mismo.")
-        elif target["role"] == "superadmin" and not is_superadmin(user):
-            st.error("Solo un superadmin puede modificar otro superadmin.")
-        else:
-            exec_sql("UPDATE users SET role=? WHERE id=?", (new_role, target["id"]))
-            st.success("Rol actualizado."); st.rerun()
+    labels = {f"{u['display_name']} ({u['chesscom_user']})": u["id"] for u in users}
 
-    st.subheader("Cambiar ELO")
-    elo_user = st.selectbox("Usuario ELO", list(labels.keys()), key="elo_user")
-    elo_target = get_user(labels[elo_user])
-    new_elo = st.number_input("Nuevo ELO", value=int(elo_target["elo"]), step=10)
-    if st.button("Actualizar ELO"):
-        exec_sql("UPDATE users SET elo=? WHERE id=?", (int(new_elo), elo_target["id"]))
-        st.success("ELO actualizado."); st.rerun()
+    if can_manage_users(user):
+        st.subheader("Crear jugador rápido")
+        new_chess = st.text_input("Usuario Chess.com nuevo")
+        new_name = st.text_input("Nombre visible opcional")
+        if st.button("Crear jugador con clave 12345"):
+            if new_chess:
+                uid, created = get_or_create_player_by_chess(new_chess, new_name, user["id"])
+                st.success("Jugador creado." if created else "Ese jugador ya existía.")
+                st.rerun()
+
+        st.subheader("Resetear contraseña")
+        reset_u = st.selectbox("Usuario", list(labels.keys()), key="reset_user")
+        if st.button("Resetear a 12345"):
+            update_password(labels[reset_u], DEFAULT_PASSWORD, must_change=1)
+            st.success("Contraseña reseteada a 12345. El jugador deberá cambiarla al entrar.")
+            st.rerun()
+
+        st.subheader("Cambiar rol / estado")
+        selected = st.selectbox("Usuario rol/estado", list(labels.keys()))
+        target = get_user(labels[selected])
+        allowed_roles = ["player", "moderator", "admin", "superadmin"] if is_superadmin(user) else ["player", "moderator", "admin"]
+        new_role = st.selectbox("Nuevo rol", allowed_roles, index=allowed_roles.index(target["role"]) if target["role"] in allowed_roles else 0)
+        new_status = st.selectbox("Estado", ["pending", "active", "suspended"], index=["pending","active","suspended"].index(target["account_status"]) if target["account_status"] in ["pending","active","suspended"] else 1)
+        if st.button("Actualizar rol/estado"):
+            if target["id"] == user["id"] and user["role"] == "superadmin" and new_role != "superadmin":
+                st.error("No te podés quitar superadmin a vos mismo.")
+            elif target["role"] == "superadmin" and not is_superadmin(user):
+                st.error("Solo un superadmin puede modificar otro superadmin.")
+            else:
+                exec_sql("UPDATE users SET role=?, account_status=? WHERE id=?", (new_role, new_status, target["id"]))
+                st.success("Usuario actualizado."); st.rerun()
+
+        st.subheader("Cambiar ELO")
+        elo_user = st.selectbox("Usuario ELO", list(labels.keys()), key="elo_user")
+        elo_target = get_user(labels[elo_user])
+        new_elo = st.number_input("Nuevo ELO", value=int(elo_target["elo"]), step=10)
+        if st.button("Actualizar ELO"):
+            exec_sql("UPDATE users SET elo=? WHERE id=?", (int(new_elo), elo_target["id"]))
+            st.success("ELO actualizado."); st.rerun()
