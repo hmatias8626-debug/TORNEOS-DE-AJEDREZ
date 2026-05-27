@@ -681,7 +681,7 @@ if not st.session_state.user:
     tab_login, tab_reg = st.tabs(["Ingresar", "Registrarme"])
     with tab_login:
         u = st.text_input("Usuario")
-        p = st.text_input("Contraseña", type="password")
+        p = st.text_input("Contraseña", type="password", key="login_password")
         if st.button("Ingresar"):
             user = login(u, p)
             if user:
@@ -693,7 +693,7 @@ if not st.session_state.user:
         nu = st.text_input("Usuario para la app")
         nd = st.text_input("Nombre visible")
         nc = st.text_input("Usuario de Chess.com")
-        np = st.text_input("Contraseña", type="password")
+        np = st.text_input("Contraseña", type="password", key="register_password")
         if st.button("Registrarme"):
             try:
                 if not nu or not np or not nc:
