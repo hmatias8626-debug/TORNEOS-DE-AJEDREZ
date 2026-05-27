@@ -10,7 +10,7 @@ from pathlib import Path
 APP_TITLE = "Torneos de Ajedrez"
 DB_PATH = Path("torneos_ajedrez.db")
 API_BASE = "https://api.chess.com/pub"
-HEADERS = {"User-Agent": "torneos-ajedrez-streamlit/6.0"}
+HEADERS = {"User-Agent": "torneos-ajedrez-streamlit/6.1"}
 DEFAULT_PASSWORD = "12345"
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
@@ -760,6 +760,29 @@ def import_history_csv(df, created_by):
     return imported
 
 
+
+def read_uploaded_csv(file):
+    encodings = ["utf-8", "utf-8-sig", "latin-1", "cp1252"]
+    seps = [",", ";", "\t"]
+    last_error = None
+
+    raw = file.getvalue()
+
+    for enc in encodings:
+        for sep in seps:
+            try:
+                import io
+                text = raw.decode(enc)
+                df = pd.read_csv(io.StringIO(text), sep=sep)
+                if len(df.columns) > 1:
+                    df.columns = [str(c).strip() for c in df.columns]
+                    return df
+            except Exception as e:
+                last_error = e
+
+    raise Exception(f"No pude leer el CSV. Probá guardarlo como CSV UTF-8. Error: {last_error}")
+
+
 def import_fixture_csv(df, created_by, default_rules="chess", default_time_class="blitz", default_time_control="300", default_rated_filter="any", strict_colors=True):
     required = {"torneo", "ronda", "fecha_inicio", "fecha_fin", "blancas_chesscom", "negras_chesscom"}
     missing = required - set(df.columns)
@@ -883,7 +906,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("♟️ Torneos de Ajedrez — V6")
+st.title("♟️ Torneos de Ajedrez — V6.1")
 
 if not st.session_state.user:
     st.markdown('<div class="login-card">', unsafe_allow_html=True)
@@ -1235,7 +1258,7 @@ elif menu == "Importar fixture":
 
     file = st.file_uploader("CSV de fixture pendiente", type=["csv"], key="fixture_csv")
     if file:
-        df = pd.read_csv(file)
+        df = read_uploaded_csv(file)
         st.dataframe(df, use_container_width=True)
 
         if st.button("Importar fixture pendiente"):
@@ -1263,7 +1286,7 @@ elif menu == "Importar historial":
     st.download_button("Descargar plantilla CSV", ejemplo.to_csv(index=False).encode("utf-8"), "plantilla_historial.csv", "text/csv")
     file = st.file_uploader("CSV histórico", type=["csv"])
     if file:
-        df = pd.read_csv(file)
+        df = read_uploaded_csv(file)
         st.dataframe(df, use_container_width=True)
         if st.button("Importar historial"):
             try:
