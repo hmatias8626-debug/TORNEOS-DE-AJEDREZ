@@ -1,26 +1,22 @@
-# TORNEOS-DE-AJEDREZ
+# TORNEOS-DE-AJEDREZ V2
 
-Primera versión de prueba de plataforma web para torneos de ajedrez.
+Versión online de prueba.
 
-## Funciones V1
+## Qué agrega V2
 
-- Registro/login de jugadores
-- Primer usuario creado queda como admin
-- Usuario de Chess.com asociado al perfil
-- Crear torneos
-- Inscripción automática de jugadores
-- Generar ronda 1
-- Detectar partidas en Chess.com por:
-  - usuario 1 vs usuario 2
-  - modalidad chess / chess960
-  - clase blitz / rapid / bullet / daily
-  - ritmo exacto
-  - rated/casual
-  - fecha posterior al inicio de ronda
-- Carga automática de resultado
-- Tabla de posiciones
-- ELO interno básico
-- Historial de partidas
+- Cantidad de rondas suizas configurable.
+- Fecha/hora inicio y fin por ronda.
+- Ronda 1 manual, aleatoria o por ELO.
+- Sistema suizo básico desde ronda 2.
+- Detección automática por ventana de ronda.
+- Resultado detectado queda bloqueado.
+- Copas configurables:
+  - Copa Oro
+  - Copa Plata
+  - Copa Bronce
+  - más copas si se desea
+- Playoffs iniciales por ranking.
+- Historial y ELO interno.
 
 ## Ejecutar local
 
@@ -29,7 +25,7 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Subir a Streamlit Community Cloud
+## Streamlit Community Cloud
 
 Main file path:
 
@@ -37,6 +33,6 @@ Main file path:
 app.py
 ```
 
-## Nota
+## Nota importante
 
-Esta V1 usa SQLite local. En Streamlit Cloud puede reiniciarse la base si la app se duerme o se redeploya. Para una versión final conviene PostgreSQL.
+Esta V2 usa SQLite local. En Streamlit Community Cloud la base puede reiniciarse ante redeploy/sleep. Para producción real conviene migrar a PostgreSQL/Supabase.
