@@ -1129,52 +1129,24 @@ elif menu == "Torneos":
 
             if can_manage_tournaments(user):
                 
-with st.expander("Modificar configuración del torneo"):
-                        st.caption("Esto cambia cómo el motor valida partidas futuras o pendientes. No modifica partidas ya detectadas/bloqueadas.")
-                                    ec1, ec2, ec3 = st.columns(3)
-                                    edit_rules = "chess" if ec1.selectbox("Modalidad fase regular", ["Ajedrez normal", "Chess960"], index=0 if t["rules"] == "chess" else 1, key=f"edit_rules_{t['id']}") == "Ajedrez normal" else "chess960"
-                                    edit_time_class = ec2.selectbox("Clase fase regular", ["blitz", "rapid", "bullet", "daily"], index=["blitz","rapid","bullet","daily"].index(t["time_class"]) if t["time_class"] in ["blitz","rapid","bullet","daily"] else 0, key=f"edit_tc_{t['id']}")
-                                    edit_time_control = ec3.text_input("Ritmo fase regular", value=str(t["time_control"]), key=f"edit_time_{t['id']}")
 
-                                    edit_rated = {"Cualquiera":"any", "Solo rated":"rated", "Solo casual":"casual"}[
-                                        st.selectbox(
-                                            "Rated/Casual fase regular",
-                                            ["Cualquiera", "Solo rated", "Solo casual"],
-                                            index={"any":0,"rated":1,"casual":2}.get(t["rated_filter"],0),
-                                            key=f"edit_rated_{t['id']}"
-                                        )
-                                    ]
-                                    edit_strict = st.checkbox("Respetar colores exactos", value=bool(t["strict_colors"]), key=f"edit_strict_{t['id']}")
+                st.subheader("Configuración del torneo")
 
-                                    st.markdown("**Playoffs**")
-                                    pc1, pc2, pc3 = st.columns(3)
-                                    pr_current = t["playoff_rules"] if "playoff_rules" in t.keys() and t["playoff_rules"] else t["rules"]
-                                    ptc_current = t["playoff_time_class"] if "playoff_time_class" in t.keys() and t["playoff_time_class"] else t["time_class"]
-                                    ptime_current = t["playoff_time_control"] if "playoff_time_control" in t.keys() and t["playoff_time_control"] else t["time_control"]
-                                    prated_current = t["playoff_rated_filter"] if "playoff_rated_filter" in t.keys() and t["playoff_rated_filter"] else t["rated_filter"]
+                new_time = st.text_input(
+                    "Ritmo fase regular",
+                    value=str(t["time_control"]),
+                    key=f"simple_time_{t['id']}"
+                )
 
-                                    edit_playoff_rules = "chess" if pc1.selectbox("Modalidad playoffs", ["Ajedrez normal", "Chess960"], index=0 if pr_current == "chess" else 1, key=f"edit_prules_{t['id']}") == "Ajedrez normal" else "chess960"
-                                    edit_playoff_time_class = pc2.selectbox("Clase playoffs", ["blitz", "rapid", "bullet", "daily"], index=["blitz","rapid","bullet","daily"].index(ptc_current) if ptc_current in ["blitz","rapid","bullet","daily"] else 0, key=f"edit_ptc_{t['id']}")
-                                    edit_playoff_time_control = pc3.text_input("Ritmo playoffs", value=str(ptime_current), key=f"edit_ptime_{t['id']}")
-                                    edit_playoff_rated = {"Cualquiera":"any", "Solo rated":"rated", "Solo casual":"casual"}[
-                                        st.selectbox(
-                                            "Rated/Casual playoffs",
-                                            ["Cualquiera", "Solo rated", "Solo casual"],
-                                            index={"any":0,"rated":1,"casual":2}.get(prated_current,0),
-                                            key=f"edit_prated_{t['id']}"
-                                        )
-                                    ]
+                if st.button("Guardar ritmo", key=f"save_time_{t['id']}"):
+                    exec_sql(
+                        "UPDATE tournaments SET time_control=? WHERE id=?",
+                        (new_time, t["id"])
+                    )
+                    st.success("Ritmo actualizado.")
+                    st.rerun()
 
-                                    if st.button("Guardar configuración del torneo", key=f"save_config_{t['id']}"):
-                                        update_tournament_settings(
-                                            t["id"],
-                                            edit_rules, edit_time_class, edit_time_control, edit_rated, edit_strict,
-                                            edit_playoff_rules, edit_playoff_time_class, edit_playoff_time_control, edit_playoff_rated
-                                        )
-                                        st.success("Configuración actualizada.")
-                                        st.rerun()
-
-                                with st.expander("Administrar participantes"):
+with st.expander("Administrar participantes"):
                                     all_users = q("SELECT id, display_name, chesscom_user FROM users WHERE account_status!='suspended' ORDER BY display_name")
                                     options = {f"{u['display_name']} ({u['chesscom_user']})": u["id"] for u in all_users}
                                     add_sel = st.multiselect("Agregar participantes al torneo", list(options.keys()), key=f"addp_{t['id']}")
