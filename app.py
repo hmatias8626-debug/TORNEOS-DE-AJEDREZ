@@ -12,7 +12,7 @@ import streamlit as st
 APP_TITLE = "Torneos de Ajedrez"
 DEFAULT_PASSWORD = "12345"
 API_BASE = "https://api.chess.com/pub"
-HEADERS = {"User-Agent": "torneos-ajedrez-v9-puntos-bye/1.0"}
+HEADERS = {"User-Agent": "torneos-ajedrez-v10-test-visual/1.0"}
 SQLITE_PATH = Path("torneos_ajedrez_local.db")
 
 
@@ -385,6 +385,10 @@ def ensure_v9_columns():
         ("tournaments", "loss_points", "REAL DEFAULT 0"),
         ("tournaments", "bye_points", "REAL DEFAULT 1"),
         ("tournaments", "wo_points", "REAL DEFAULT 0"),
+        ("tournaments", "rounds_count", "INTEGER DEFAULT 0"),
+        ("tournaments", "cups_count", "INTEGER DEFAULT 3"),
+        ("tournaments", "qualifiers_count", "INTEGER DEFAULT 24"),
+        ("tournaments", "cup_size", "INTEGER DEFAULT 8"),
     ]
     for table, col, definition in cols:
         ensure_column_runtime(table, col, definition)
@@ -1310,6 +1314,156 @@ def standings(tournament_id):
     return table
 
 
+
+def match_score_parts(result, result_type):
+    if result_type == "bye" or result == "BYE":
+        return ("BYE", "")
+    if result_type == "wo" or result == "0-0 WO":
+        return ("WO", "WO")
+    if result == "1-0":
+        return ("1", "0")
+    if result == "0-1":
+        return ("0", "1")
+    if result == "1/2-1/2":
+        return ("½", "½")
+    return ("", "")
+
+
+def match_status_badge(status, result_type):
+    if result_type == "bye":
+        return "🟦 LIBRE"
+    if result_type == "wo":
+        return "🟥 WO"
+    if status == "finished":
+        return "✅ Finalizada"
+    if status == "review":
+        return "🟧 Revisión"
+    if status == "pending":
+        return "⬜ Pendiente"
+    return status
+
+
+def round_visual_rows(tournament_id, round_number):
+    rows = q("""
+        SELECT m.*, r.number, r.start_datetime, r.end_datetime,
+               wu.display_name AS white_name, wu.chesscom_user AS white_chess, wu.elo AS white_elo,
+               bu.display_name AS black_name, bu.chesscom_user AS black_chess, bu.elo AS black_elo
+        FROM matches m
+        JOIN rounds r ON r.id=m.round_id
+        JOIN users wu ON wu.id=m.white_user_id
+        LEFT JOIN users bu ON bu.id=m.black_user_id
+        WHERE m.tournament_id=? AND r.number=?
+        ORDER BY m.id
+    """, (tournament_id, round_number))
+
+    out = []
+    for m in rows:
+        ws, bs = match_score_parts(m.get("result"), m.get("result_type"))
+        out.append({
+            "♙ ELO": m["white_elo"],
+            "Blancas": m["white_name"],
+            "Usuario blancas": m["white_chess"],
+            "Pts": ws,
+            "VS": "vs",
+            "Pts ": bs,
+            "Usuario negras": m["black_chess"] or "LIBRE/BYE",
+            "Negras": m["black_name"] or "LIBRE/BYE",
+            "♟ ELO": m["black_elo"] if m["black_elo"] is not None else "",
+            "Fecha": str(m["start_datetime"])[:10],
+            "Estado": match_status_badge(m["status"], m["result_type"]),
+            "Link": m["chesscom_url"] or "",
+        })
+    return out
+
+
+def pending_count_for_tournament(tournament_id):
+    row = q("""
+        SELECT COUNT(*) AS c
+        FROM matches
+        WHERE tournament_id=? AND status='pending' AND locked=0 AND black_user_id IS NOT NULL
+    """, (tournament_id,), one=True)
+    return int(row["c"]) if row else 0
+
+
+def safe_scan_tournament(tournament_id):
+    pc = pending_count_for_tournament(tournament_id)
+    if pc <= 0:
+        return 0, [{"Cruce": "-", "Estado": "sin cruces pendientes para buscar; no se consulta Chess.com"}]
+    return scan_tournament(tournament_id)
+
+
+def cup_names(count):
+    base = ["Oro", "Plata", "Bronce", "Cobre", "Hierro", "Promoción"]
+    names = []
+    for i in range(count):
+        names.append(base[i] if i < len(base) else f"Copa {i+1}")
+    return names
+
+
+def playoff_seed_rows(tournament_id):
+    table = standings(tournament_id)
+    tournament = q("SELECT * FROM tournaments WHERE id=?", (tournament_id,), one=True) or {}
+    cups_count = int(tournament.get("cups_count") or 3)
+    cup_size = int(tournament.get("cup_size") or 8)
+    names = cup_names(cups_count)
+
+    rows = []
+    pos = 1
+    for ci, cname in enumerate(names):
+        start = ci * cup_size
+        end = start + cup_size
+        for p in table[start:end]:
+            rows.append({
+                "Copa": cname,
+                "Seed": pos,
+                "Jugador": p["Jugador"],
+                "Chess.com": p["Chess.com"],
+                "Puntos": p["Puntos"],
+                "Buchholz": p.get("Buchholz", 0),
+                "ELO": p["ELO"],
+            })
+            pos += 1
+    return rows
+
+
+def render_playoff_bracket(tournament_id):
+    seeds = playoff_seed_rows(tournament_id)
+    if not seeds:
+        st.info("Todavía no hay clasificados para mostrar.")
+        return
+
+    cups = {}
+    for s in seeds:
+        cups.setdefault(s["Copa"], []).append(s)
+
+    for cup, players in cups.items():
+        st.markdown(f"### 🏆 Copa {cup}")
+        st.caption("Vista preliminar por ranking. La llave definitiva se podrá generar cuando cierre la fase regular.")
+
+        half = (len(players) + 1) // 2
+        left = players[:half]
+        right = players[half:][::-1]
+
+        c1, c2, c3 = st.columns([2, 1, 2])
+        with c1:
+            st.markdown("**Lado A**")
+            for p in left:
+                st.markdown(
+                    f"<div class='bracket-box'>#{p['Seed']} · {p['Jugador']}<br><small>{p['Chess.com']} · {p['Puntos']} pts · ELO {p['ELO']}</small></div>",
+                    unsafe_allow_html=True
+                )
+        with c2:
+            st.markdown("<div class='cup-center'>🏆<br>FINAL</div>", unsafe_allow_html=True)
+        with c3:
+            st.markdown("**Lado B**")
+            for p in right:
+                st.markdown(
+                    f"<div class='bracket-box'>#{p['Seed']} · {p['Jugador']}<br><small>{p['Chess.com']} · {p['Puntos']} pts · ELO {p['ELO']}</small></div>",
+                    unsafe_allow_html=True
+                )
+
+
+
 # =========================================================
 # UI
 # =========================================================
@@ -1322,14 +1476,31 @@ if "user" not in st.session_state:
 
 st.markdown("""
 <style>
-.block-container {max-width: 1200px;}
+.block-container {max-width: 1320px;}
 .login-box {max-width: 440px; margin: 0 auto;}
 .login-box [data-testid="stTextInput"] {max-width: 440px;}
 .login-box .stButton button {width: 180px;}
+.bracket-box {
+    border: 1px solid #d7dce2;
+    border-radius: 12px;
+    padding: 10px 12px;
+    margin: 8px 0;
+    background: linear-gradient(180deg, #ffffff, #f7f9fc);
+    box-shadow: 0 1px 3px rgba(0,0,0,.05);
+}
+.cup-center {
+    text-align: center;
+    font-size: 28px;
+    border: 1px solid #d7dce2;
+    border-radius: 16px;
+    padding: 24px 8px;
+    margin-top: 36px;
+    background: #fff8e6;
+}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("♟️ Torneos de Ajedrez — V9.1 puntos + BYE")
+st.title("♟️ Torneos de Ajedrez — V10 TEST visual")
 
 if use_postgres():
     st.sidebar.success("DB: Supabase/PostgreSQL")
@@ -1412,6 +1583,13 @@ if choice == "Crear torneo":
     ]
     strict_colors = st.checkbox("Respetar colores exactos", value=True)
 
+    st.subheader("Estructura del torneo")
+    et1, et2, et3, et4 = st.columns(4)
+    rounds_count = et1.number_input("Cantidad de rondas", value=5, min_value=1, step=1)
+    cups_count = et2.number_input("Cantidad de copas", value=3, min_value=1, step=1)
+    qualifiers_count = et3.number_input("Clasificados a playoffs", value=24, min_value=2, step=1)
+    cup_size = et4.number_input("Jugadores por copa", value=8, min_value=2, step=2)
+
     st.subheader("Sistema de puntos")
     pp1, pp2, pp3, pp4, pp5 = st.columns(5)
     win_points = pp1.number_input("Victoria", value=1.0, step=0.5, key="ct_win")
@@ -1425,7 +1603,13 @@ if choice == "Crear torneo":
             st.warning("Poné un nombre.")
         else:
             tid = create_empty_tournament(name.strip(), desc, rules, time_class, time_control, rated_filter, strict_colors, current_user["id"])
-            exec_sql("UPDATE tournaments SET win_points=?, draw_points=?, loss_points=?, bye_points=?, wo_points=? WHERE id=?", (win_points, draw_points, loss_points, bye_points, wo_points, tid))
+            exec_sql("""
+                UPDATE tournaments
+                SET win_points=?, draw_points=?, loss_points=?, bye_points=?, wo_points=?,
+                    rounds_count=?, cups_count=?, qualifiers_count=?, cup_size=?
+                WHERE id=?
+            """, (win_points, draw_points, loss_points, bye_points, wo_points,
+                  rounds_count, cups_count, qualifiers_count, cup_size, tid))
             st.success(f"Torneo creado. ID: {tid}")
 
 elif choice == "Importar fixture":
@@ -1518,6 +1702,13 @@ elif choice == "Torneos":
                     playoff_time = pc1.text_input("Ritmo playoffs", value=str(t["playoff_time_control"]), key=f"ptime_{t['id']}")
                     playoff_class = pc2.selectbox("Clase playoffs", ["rapid", "blitz", "bullet", "daily"], index=["rapid", "blitz", "bullet", "daily"].index(t["playoff_time_class"]) if t["playoff_time_class"] in ["rapid", "blitz", "bullet", "daily"] else 1, key=f"pclass_{t['id']}")
 
+                    st.markdown("**Estructura**")
+                    es1, es2, es3, es4 = st.columns(4)
+                    edit_rounds_count = es1.number_input("Rondas", value=int(t.get("rounds_count", 0) or 0), min_value=0, step=1, key=f"rounds_count_{t['id']}")
+                    edit_cups_count = es2.number_input("Copas", value=int(t.get("cups_count", 3) or 3), min_value=1, step=1, key=f"cups_count_{t['id']}")
+                    edit_qualifiers_count = es3.number_input("Clasificados", value=int(t.get("qualifiers_count", 24) or 24), min_value=2, step=1, key=f"qualifiers_count_{t['id']}")
+                    edit_cup_size = es4.number_input("Por copa", value=int(t.get("cup_size", 8) or 8), min_value=2, step=2, key=f"cup_size_{t['id']}")
+
                     st.markdown("**Sistema de puntos**")
                     pp1, pp2, pp3, pp4, pp5 = st.columns(5)
                     edit_win = pp1.number_input("Victoria", value=float(t.get("win_points", 1) or 1), step=0.5, key=f"win_{t['id']}")
@@ -1530,10 +1721,12 @@ elif choice == "Torneos":
                         exec_sql("""
                             UPDATE tournaments
                             SET time_control=?, time_class=?, strict_colors=?, playoff_time_control=?, playoff_time_class=?,
-                                win_points=?, draw_points=?, loss_points=?, bye_points=?, wo_points=?
+                                win_points=?, draw_points=?, loss_points=?, bye_points=?, wo_points=?,
+                                rounds_count=?, cups_count=?, qualifiers_count=?, cup_size=?
                             WHERE id=?
                         """, (new_time, new_class, 1 if strict else 0, playoff_time, playoff_class,
-                              edit_win, edit_draw, edit_loss, edit_bye, edit_wo, t["id"]))
+                              edit_win, edit_draw, edit_loss, edit_bye, edit_wo,
+                              edit_rounds_count, edit_cups_count, edit_qualifiers_count, edit_cup_size, t["id"]))
                         st.success("Configuración guardada.")
                         st.rerun()
 
@@ -1555,7 +1748,7 @@ elif choice == "Torneos":
 
                 b1, b2 = st.columns(2)
                 if b1.button("Buscar resultados Chess.com", key=f"scan_{t['id']}"):
-                    found, debug = scan_tournament(t["id"])
+                    found, debug = safe_scan_tournament(t["id"])
                     st.success(f"Detectadas: {found}")
                     st.dataframe(debug, use_container_width=True)
 
@@ -1569,7 +1762,7 @@ elif choice == "Torneos":
                     auto = st.checkbox("Detectar automáticamente cada 1 minuto", key=f"auto_{t['id']}")
                     if auto:
                         st.markdown('<meta http-equiv="refresh" content="60">', unsafe_allow_html=True)
-                        found, debug = scan_tournament(t["id"])
+                        found, debug = safe_scan_tournament(t["id"])
                         st.caption(f"Auto-búsqueda ejecutada. Detectadas: {found}")
                         st.dataframe(debug, use_container_width=True)
 
@@ -1637,6 +1830,19 @@ elif choice == "Torneos":
                                 st.rerun()
                             except Exception as exc:
                                 st.error(exc)
+
+            st.subheader("Vista de ronda")
+            rounds_for_view = q("SELECT number,start_datetime,end_datetime,status FROM rounds WHERE tournament_id=? ORDER BY number", (t["id"],))
+            if rounds_for_view:
+                round_options = [int(r["number"]) for r in rounds_for_view]
+                selected_round = st.selectbox("Seleccionar ronda", round_options, key=f"view_round_{t['id']}")
+                visual_rows = round_visual_rows(t["id"], selected_round)
+                st.dataframe(visual_rows, use_container_width=True, hide_index=True)
+            else:
+                st.info("Este torneo todavía no tiene rondas.")
+
+            st.subheader("Playoffs / Copas")
+            render_playoff_bracket(t["id"])
 
             st.subheader("Rondas")
             rounds = q("SELECT number,start_datetime,end_datetime,status FROM rounds WHERE tournament_id=? ORDER BY number", (t["id"],))
