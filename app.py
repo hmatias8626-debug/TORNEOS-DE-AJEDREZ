@@ -12,7 +12,7 @@ import streamlit as st
 APP_TITLE = "Torneos de Ajedrez"
 DEFAULT_PASSWORD = "12345"
 API_BASE = "https://api.chess.com/pub"
-HEADERS = {"User-Agent": "torneos-ajedrez-v8-supabase/1.0"}
+HEADERS = {"User-Agent": "torneos-ajedrez-v9-puntos-bye/1.0"}
 SQLITE_PATH = Path("torneos_ajedrez_local.db")
 
 
@@ -152,6 +152,11 @@ def init_db():
             playoff_time_class TEXT DEFAULT 'blitz',
             playoff_time_control TEXT DEFAULT '300',
             playoff_rated_filter TEXT DEFAULT 'any',
+            win_points REAL DEFAULT 1,
+            draw_points REAL DEFAULT 0.5,
+            loss_points REAL DEFAULT 0,
+            bye_points REAL DEFAULT 1,
+            wo_points REAL DEFAULT 0,
             created_by INTEGER,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -264,6 +269,11 @@ def init_db():
             playoff_time_class TEXT DEFAULT 'blitz',
             playoff_time_control TEXT DEFAULT '300',
             playoff_rated_filter TEXT DEFAULT 'any',
+            win_points REAL DEFAULT 1,
+            draw_points REAL DEFAULT 0.5,
+            loss_points REAL DEFAULT 0,
+            bye_points REAL DEFAULT 1,
+            wo_points REAL DEFAULT 0,
             created_by INTEGER,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
@@ -337,6 +347,41 @@ def init_db():
 
     c.commit()
     c.close()
+
+
+
+def column_exists_runtime(table, column):
+    c = conn()
+    cur = c.cursor()
+    if use_postgres():
+        cur.execute("""
+            SELECT COUNT(*) AS c
+            FROM information_schema.columns
+            WHERE table_name=%s AND column_name=%s
+        """, (table, column))
+        exists = cur.fetchone()[0] > 0
+    else:
+        cur.execute(f"PRAGMA table_info({table})")
+        exists = column in [row[1] for row in cur.fetchall()]
+    c.close()
+    return exists
+
+
+def ensure_column_runtime(table, column, definition):
+    if not column_exists_runtime(table, column):
+        exec_sql(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def ensure_v9_columns():
+    cols = [
+        ("tournaments", "win_points", "REAL DEFAULT 1"),
+        ("tournaments", "draw_points", "REAL DEFAULT 0.5"),
+        ("tournaments", "loss_points", "REAL DEFAULT 0"),
+        ("tournaments", "bye_points", "REAL DEFAULT 1"),
+        ("tournaments", "wo_points", "REAL DEFAULT 0"),
+    ]
+    for table, col, definition in cols:
+        ensure_column_runtime(table, col, definition)
 
 
 def insert_returning(table, cols, values):
@@ -459,6 +504,21 @@ def parse_ts(timestamp):
     except Exception:
         return None
 
+
+
+def is_bye_value(value):
+    v = norm(value)
+    return v in {"", "0", "bye", "libre", "free", "descanso", "sin rival", "none", "nan", "-"}
+
+
+def tournament_points_config(tournament):
+    return {
+        "win": float(tournament.get("win_points", 1) if tournament.get("win_points") is not None else 1),
+        "draw": float(tournament.get("draw_points", 0.5) if tournament.get("draw_points") is not None else 0.5),
+        "loss": float(tournament.get("loss_points", 0) if tournament.get("loss_points") is not None else 0),
+        "bye": float(tournament.get("bye_points", 1) if tournament.get("bye_points") is not None else 1),
+        "wo": float(tournament.get("wo_points", 0) if tournament.get("wo_points") is not None else 0),
+    }
 
 # =========================================================
 # USERS / ALIASES
@@ -787,7 +847,7 @@ def scan_tournament(tournament_id):
         FROM matches m
         JOIN rounds r ON r.id=m.round_id
         JOIN users wu ON wu.id=m.white_user_id
-        JOIN users bu ON bu.id=m.black_user_id
+        LEFT JOIN users bu ON bu.id=m.black_user_id
         WHERE m.tournament_id=? AND m.status='pending' AND m.locked=0
     """, (tournament_id,))
 
@@ -915,14 +975,28 @@ def import_fixture_csv(df, created_by, rules, time_class, time_control, rated_fi
             for _, row in round_df.iterrows():
                 white_raw = norm(row["blancas_chesscom"])
                 black_raw = norm(row["negras_chesscom"])
-                if not valid_chess_username(white_raw) or not valid_chess_username(black_raw):
+
+                if not valid_chess_username(white_raw):
                     continue
 
                 white_id, wc = get_or_create_player(white_raw)
-                black_id, bc = get_or_create_player(black_raw)
-                created_players += int(wc) + int(bc)
-
+                created_players += int(wc)
                 register_player(tournament_id, white_id)
+
+                if is_bye_value(black_raw):
+                    insert_returning(
+                        "matches",
+                        ["tournament_id", "round_id", "white_user_id", "black_user_id", "status", "result", "result_type", "locked"],
+                        [tournament_id, round_id, white_id, None, "finished", "BYE", "bye", 1],
+                    )
+                    created_matches += 1
+                    continue
+
+                if not valid_chess_username(black_raw):
+                    continue
+
+                black_id, bc = get_or_create_player(black_raw)
+                created_players += int(bc)
                 register_player(tournament_id, black_id)
 
                 insert_returning(
@@ -1055,7 +1129,7 @@ def set_manual_result(match_id, result, admin_user_id):
         WHERE id=?
     """, (result, dt.datetime.now(), match_id))
 
-    if old_status != "finished":
+    if old_status != "finished" and match.get("black_user_id") is not None:
         apply_elo(match_id, match["white_user_id"], match["black_user_id"], score)
 
     audit(admin_user_id, "manual_result", f"match={match_id}, result={result}")
@@ -1107,13 +1181,69 @@ def apply_wo_expired(tournament_id):
 # STANDINGS
 # =========================================================
 
+def head_to_head_opponents(tournament_id, user_id):
+    matches = q("""
+        SELECT * FROM matches
+        WHERE tournament_id=? AND status='finished'
+        AND result_type NOT IN ('bye', 'wo')
+        AND (white_user_id=? OR black_user_id=?)
+    """, (tournament_id, user_id, user_id))
+    opponents = []
+    for m in matches:
+        if m["white_user_id"] == user_id:
+            opponents.append(m["black_user_id"])
+        else:
+            opponents.append(m["white_user_id"])
+    return [op for op in opponents if op is not None]
+
+
+def raw_points_for_user(tournament_id, user_id, points_cfg):
+    matches = q("""
+        SELECT * FROM matches
+        WHERE tournament_id=? AND status='finished'
+        AND (white_user_id=? OR black_user_id=?)
+    """, (tournament_id, user_id, user_id))
+
+    pts = 0.0
+    for m in matches:
+        if m["result_type"] == "bye" or m["result"] == "BYE":
+            if m["white_user_id"] == user_id:
+                pts += points_cfg["bye"]
+            continue
+
+        if m["result_type"] == "wo":
+            pts += points_cfg["wo"]
+            continue
+
+        if m["white_user_id"] == user_id:
+            if m["result"] == "1-0":
+                pts += points_cfg["win"]
+            elif m["result"] == "0-1":
+                pts += points_cfg["loss"]
+            elif m["result"] == "1/2-1/2":
+                pts += points_cfg["draw"]
+        elif m["black_user_id"] == user_id:
+            if m["result"] == "0-1":
+                pts += points_cfg["win"]
+            elif m["result"] == "1-0":
+                pts += points_cfg["loss"]
+            elif m["result"] == "1/2-1/2":
+                pts += points_cfg["draw"]
+    return pts
+
+
 def standings(tournament_id):
+    tournament = q("SELECT * FROM tournaments WHERE id=?", (tournament_id,), one=True)
+    points_cfg = tournament_points_config(tournament or {})
+
     regs = q("""
         SELECT u.id, u.display_name, u.chesscom_user, u.elo, r.status, r.wo_count
         FROM registrations r
         JOIN users u ON u.id=r.user_id
         WHERE r.tournament_id=? AND r.status!='removed'
     """, (tournament_id,))
+
+    base_points = {u["id"]: raw_points_for_user(tournament_id, u["id"], points_cfg) for u in regs}
 
     table = []
     for user in regs:
@@ -1123,41 +1253,54 @@ def standings(tournament_id):
             AND (white_user_id=? OR black_user_id=?)
         """, (tournament_id, user["id"], user["id"]))
 
-        pts = wins = draws = losses = wo = 0
+        wins = draws = losses = wo = byes = real_played = 0
         for match in matches:
+            if match["result_type"] == "bye" or match["result"] == "BYE":
+                byes += 1
+                continue
+
             if match["result_type"] == "wo":
                 wo += 1
                 continue
 
+            real_played += 1
             if match["white_user_id"] == user["id"]:
                 if match["result"] == "1-0":
-                    pts += 1; wins += 1
+                    wins += 1
                 elif match["result"] == "0-1":
                     losses += 1
                 elif match["result"] == "1/2-1/2":
-                    pts += 0.5; draws += 1
+                    draws += 1
             else:
                 if match["result"] == "0-1":
-                    pts += 1; wins += 1
+                    wins += 1
                 elif match["result"] == "1-0":
                     losses += 1
                 elif match["result"] == "1/2-1/2":
-                    pts += 0.5; draws += 1
+                    draws += 1
+
+        opponents = head_to_head_opponents(tournament_id, user["id"])
+        buchholz = sum(base_points.get(op, 0) for op in opponents)
+        opp_scores = sorted([base_points.get(op, 0) for op in opponents])
+        buc1 = sum(opp_scores[1:]) if len(opp_scores) > 1 else buchholz
 
         table.append({
             "Jugador": user["display_name"],
             "Chess.com": user["chesscom_user"],
             "ELO": user["elo"],
-            "PJ": len(matches),
+            "PJ reales": real_played,
+            "BYE": byes,
             "G": wins,
             "E": draws,
             "P": losses,
             "WO": user["wo_count"],
             "Estado": user["status"],
-            "Puntos": pts,
+            "Puntos": base_points[user["id"]],
+            "Buchholz": round(buchholz, 2),
+            "Buc1": round(buc1, 2),
         })
 
-    table.sort(key=lambda x: (x["Estado"] != "disqualified", x["Puntos"], x["ELO"], x["G"]), reverse=True)
+    table.sort(key=lambda x: (x["Estado"] != "disqualified", x["Puntos"], x["Buchholz"], x["Buc1"], x["ELO"], x["G"]), reverse=True)
     return table
 
 
@@ -1166,6 +1309,7 @@ def standings(tournament_id):
 # =========================================================
 
 init_db()
+ensure_v9_columns()
 
 if "user" not in st.session_state:
     st.session_state.user = None
@@ -1179,7 +1323,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("♟️ Torneos de Ajedrez — V8 Supabase")
+st.title("♟️ Torneos de Ajedrez — V9 puntos + BYE")
 
 if use_postgres():
     st.sidebar.success("DB: Supabase/PostgreSQL")
@@ -1262,16 +1406,25 @@ if choice == "Crear torneo":
     ]
     strict_colors = st.checkbox("Respetar colores exactos", value=True)
 
+    st.subheader("Sistema de puntos")
+    pp1, pp2, pp3, pp4, pp5 = st.columns(5)
+    win_points = pp1.number_input("Victoria", value=1.0, step=0.5, key="ct_win")
+    draw_points = pp2.number_input("Empate", value=0.5, step=0.5, key="ct_draw")
+    loss_points = pp3.number_input("Derrota", value=0.0, step=0.5, key="ct_loss")
+    bye_points = pp4.number_input("Libre/BYE", value=1.0, step=0.5, key="ct_bye")
+    wo_points = pp5.number_input("WO", value=0.0, step=0.5, key="ct_wo")
+
     if st.button("Crear torneo"):
         if not name.strip():
             st.warning("Poné un nombre.")
         else:
             tid = create_empty_tournament(name.strip(), desc, rules, time_class, time_control, rated_filter, strict_colors, current_user["id"])
+            exec_sql("UPDATE tournaments SET win_points=?, draw_points=?, loss_points=?, bye_points=?, wo_points=? WHERE id=?", (win_points, draw_points, loss_points, bye_points, wo_points, tid))
             st.success(f"Torneo creado. ID: {tid}")
 
 elif choice == "Importar fixture":
     st.header("Importar fixture completo")
-    st.write("Columnas: `torneo`, `ronda`, `fecha_inicio`, `fecha_fin`, `blancas_chesscom`, `negras_chesscom`.")
+    st.write("Columnas: `torneo`, `ronda`, `fecha_inicio`, `fecha_fin`, `blancas_chesscom`, `negras_chesscom`. Para jugador libre usá `LIBRE`, `BYE`, vacío o `0` en negras_chesscom.")
 
     template = pd.DataFrame([{
         "torneo": "TORNEO N°11",
@@ -1359,12 +1512,22 @@ elif choice == "Torneos":
                     playoff_time = pc1.text_input("Ritmo playoffs", value=str(t["playoff_time_control"]), key=f"ptime_{t['id']}")
                     playoff_class = pc2.selectbox("Clase playoffs", ["rapid", "blitz", "bullet", "daily"], index=["rapid", "blitz", "bullet", "daily"].index(t["playoff_time_class"]) if t["playoff_time_class"] in ["rapid", "blitz", "bullet", "daily"] else 1, key=f"pclass_{t['id']}")
 
+                    st.markdown("**Sistema de puntos**")
+                    pp1, pp2, pp3, pp4, pp5 = st.columns(5)
+                    edit_win = pp1.number_input("Victoria", value=float(t.get("win_points", 1) or 1), step=0.5, key=f"win_{t['id']}")
+                    edit_draw = pp2.number_input("Empate", value=float(t.get("draw_points", 0.5) or 0.5), step=0.5, key=f"draw_{t['id']}")
+                    edit_loss = pp3.number_input("Derrota", value=float(t.get("loss_points", 0) or 0), step=0.5, key=f"loss_{t['id']}")
+                    edit_bye = pp4.number_input("BYE/libre", value=float(t.get("bye_points", 1) or 1), step=0.5, key=f"bye_{t['id']}")
+                    edit_wo = pp5.number_input("WO", value=float(t.get("wo_points", 0) or 0), step=0.5, key=f"wo_pts_{t['id']}")
+
                     if st.button("Guardar configuración", key=f"save_t_{t['id']}"):
                         exec_sql("""
                             UPDATE tournaments
-                            SET time_control=?, time_class=?, strict_colors=?, playoff_time_control=?, playoff_time_class=?
+                            SET time_control=?, time_class=?, strict_colors=?, playoff_time_control=?, playoff_time_class=?,
+                                win_points=?, draw_points=?, loss_points=?, bye_points=?, wo_points=?
                             WHERE id=?
-                        """, (new_time, new_class, 1 if strict else 0, playoff_time, playoff_class, t["id"]))
+                        """, (new_time, new_class, 1 if strict else 0, playoff_time, playoff_class,
+                              edit_win, edit_draw, edit_loss, edit_bye, edit_wo, t["id"]))
                         st.success("Configuración guardada.")
                         st.rerun()
 
@@ -1411,12 +1574,12 @@ elif choice == "Torneos":
                         FROM matches m
                         JOIN rounds r ON r.id=m.round_id
                         JOIN users wu ON wu.id=m.white_user_id
-                        JOIN users bu ON bu.id=m.black_user_id
+                        LEFT JOIN users bu ON bu.id=m.black_user_id
                         WHERE m.tournament_id=?
                         ORDER BY r.number, m.id
                     """, (t["id"],))
                     if all_matches:
-                        labels = {f"R{m['number']} | {m['white_chess']} vs {m['black_chess']} | {m['status']} | {m['result'] or 'sin resultado'}": m["id"] for m in all_matches}
+                        labels = {f"R{m['number']} | {m['white_chess']} vs {m['black_chess'] or 'LIBRE/BYE'} | {m['status']} | {m['result'] or 'sin resultado'}": m["id"] for m in all_matches}
                         sel = st.selectbox("Partida", list(labels.keys()), key=f"manual_match_{t['id']}")
                         res = st.selectbox("Resultado", ["1-0", "0-1", "1/2-1/2"], key=f"manual_res_{t['id']}")
                         cm1, cm2 = st.columns(2)
@@ -1442,7 +1605,7 @@ elif choice == "Torneos":
                     FROM matches m
                     JOIN rounds r ON r.id=m.round_id
                     JOIN users wu ON wu.id=m.white_user_id
-                    JOIN users bu ON bu.id=m.black_user_id
+                    LEFT JOIN users bu ON bu.id=m.black_user_id
                     WHERE m.tournament_id=? AND m.status='review'
                     ORDER BY r.number, m.id
                 """, (t["id"],))
@@ -1481,14 +1644,14 @@ elif choice == "Torneos":
                 FROM matches m
                 JOIN rounds r ON r.id=m.round_id
                 JOIN users wu ON wu.id=m.white_user_id
-                JOIN users bu ON bu.id=m.black_user_id
+                LEFT JOIN users bu ON bu.id=m.black_user_id
                 WHERE m.tournament_id=?
                 ORDER BY r.number, m.id
             """, (t["id"],))
             st.dataframe([{
                 "Ronda": m["number"],
                 "Blancas": m["white_chess"],
-                "Negras": m["black_chess"],
+                "Negras": m["black_chess"] or "LIBRE/BYE",
                 "Estado": m["status"],
                 "Tipo": m["result_type"],
                 "Resultado": m["result"] or "",
