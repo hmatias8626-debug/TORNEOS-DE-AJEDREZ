@@ -1,224 +1,358 @@
 import datetime as dt
 import hashlib
 import io
-import sqlite3
+import os
 from pathlib import Path
 
 import pandas as pd
 import requests
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
 
 
 APP_TITLE = "Torneos de Ajedrez"
-DB_PATH = Path("torneos_ajedrez.db")
-API_BASE = "https://api.chess.com/pub"
 DEFAULT_PASSWORD = "12345"
-HEADERS = {"User-Agent": "torneos-ajedrez-v7-estable/1.0"}
+API_BASE = "https://api.chess.com/pub"
+HEADERS = {"User-Agent": "torneos-ajedrez-v8-supabase/1.0"}
+SQLITE_PATH = Path("torneos_ajedrez_local.db")
 
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 
 
 # =========================================================
-# DB
+# DB ENGINE: Supabase/PostgreSQL + SQLite fallback local
 # =========================================================
 
-def db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+def has_pg_secrets():
+    needed = ["DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD"]
+    return all(k in st.secrets for k in needed)
+
+
+def use_postgres():
+    return has_pg_secrets()
+
+
+def pg_conn():
+    import psycopg2
+    return psycopg2.connect(
+        host=st.secrets["DB_HOST"],
+        port=int(st.secrets["DB_PORT"]),
+        dbname=st.secrets["DB_NAME"],
+        user=st.secrets["DB_USER"],
+        password=st.secrets["DB_PASSWORD"],
+        sslmode="require",
+    )
+
+
+def sqlite_conn():
+    import sqlite3
+    conn = sqlite3.connect(SQLITE_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
 
+def conn():
+    return pg_conn() if use_postgres() else sqlite_conn()
+
+
+def adapt_sql(sql):
+    if use_postgres():
+        return sql.replace("?", "%s")
+    return sql
+
+
+def rows_to_dicts(cursor, rows):
+    if use_postgres():
+        cols = [d[0] for d in cursor.description] if cursor.description else []
+        return [dict(zip(cols, row)) for row in rows]
+    return [dict(row) for row in rows]
+
+
 def q(sql, params=(), one=False):
-    conn = db()
-    cur = conn.cursor()
-    cur.execute(sql, params)
+    c = conn()
+    cur = c.cursor()
+    cur.execute(adapt_sql(sql), params)
     rows = cur.fetchall()
-    conn.close()
+    out = rows_to_dicts(cur, rows)
+    c.close()
     if one:
-        return rows[0] if rows else None
-    return rows
+        return out[0] if out else None
+    return out
 
 
 def exec_sql(sql, params=()):
-    conn = db()
-    cur = conn.cursor()
-    cur.execute(sql, params)
-    conn.commit()
-    last_id = cur.lastrowid
-    conn.close()
+    c = conn()
+    cur = c.cursor()
+    cur.execute(adapt_sql(sql), params)
+    last_id = None
+
+    if use_postgres():
+        try:
+            if cur.description:
+                row = cur.fetchone()
+                if row:
+                    last_id = row[0]
+        except Exception:
+            last_id = None
+    else:
+        last_id = cur.lastrowid
+
+    c.commit()
+    c.close()
     return last_id
 
 
-def column_exists(table, column):
-    conn = db()
-    cur = conn.cursor()
-    cur.execute(f"PRAGMA table_info({table})")
-    cols = [r[1] for r in cur.fetchall()]
-    conn.close()
-    return column in cols
-
-
-def ensure_column(table, column, definition):
-    if not column_exists(table, column):
-        conn = db()
-        cur = conn.cursor()
-        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-        conn.commit()
-        conn.close()
+def db_now_default():
+    return "CURRENT_TIMESTAMP"
 
 
 def init_db():
-    conn = db()
-    cur = conn.cursor()
+    c = conn()
+    cur = c.cursor()
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE,
-        password_hash TEXT,
-        chesscom_user TEXT UNIQUE,
-        display_name TEXT,
-        role TEXT DEFAULT 'player',
-        elo INTEGER DEFAULT 1200,
-        avatar_url TEXT,
-        account_status TEXT DEFAULT 'pending',
-        must_change_password INTEGER DEFAULT 1,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
+    if use_postgres():
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            username TEXT UNIQUE,
+            password_hash TEXT,
+            chesscom_user TEXT UNIQUE,
+            display_name TEXT,
+            role TEXT DEFAULT 'player',
+            elo INTEGER DEFAULT 1200,
+            avatar_url TEXT,
+            account_status TEXT DEFAULT 'pending',
+            must_change_password INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS chess_aliases (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        alias TEXT UNIQUE,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS chess_aliases (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            alias TEXT UNIQUE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS tournaments (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT,
-        description TEXT,
-        status TEXT DEFAULT 'open',
-        tournament_type TEXT DEFAULT 'fixture',
-        rules TEXT DEFAULT 'chess',
-        time_class TEXT DEFAULT 'blitz',
-        time_control TEXT DEFAULT '600',
-        rated_filter TEXT DEFAULT 'any',
-        strict_colors INTEGER DEFAULT 1,
-        playoff_rules TEXT DEFAULT 'chess',
-        playoff_time_class TEXT DEFAULT 'blitz',
-        playoff_time_control TEXT DEFAULT '300',
-        playoff_rated_filter TEXT DEFAULT 'any',
-        created_by INTEGER,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS tournaments (
+            id SERIAL PRIMARY KEY,
+            name TEXT,
+            description TEXT,
+            status TEXT DEFAULT 'open',
+            tournament_type TEXT DEFAULT 'fixture',
+            rules TEXT DEFAULT 'chess',
+            time_class TEXT DEFAULT 'rapid',
+            time_control TEXT DEFAULT '600',
+            rated_filter TEXT DEFAULT 'any',
+            strict_colors INTEGER DEFAULT 1,
+            playoff_rules TEXT DEFAULT 'chess',
+            playoff_time_class TEXT DEFAULT 'blitz',
+            playoff_time_control TEXT DEFAULT '300',
+            playoff_rated_filter TEXT DEFAULT 'any',
+            created_by INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS rounds (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        tournament_id INTEGER,
-        number INTEGER,
-        start_datetime TEXT,
-        end_datetime TEXT,
-        status TEXT DEFAULT 'active'
-    )
-    """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS rounds (
+            id SERIAL PRIMARY KEY,
+            tournament_id INTEGER REFERENCES tournaments(id) ON DELETE CASCADE,
+            number INTEGER,
+            start_datetime TIMESTAMP,
+            end_datetime TIMESTAMP,
+            status TEXT DEFAULT 'active'
+        )
+        """)
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS registrations (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        tournament_id INTEGER,
-        user_id INTEGER,
-        status TEXT DEFAULT 'active',
-        wo_count INTEGER DEFAULT 0,
-        UNIQUE(tournament_id, user_id)
-    )
-    """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS registrations (
+            id SERIAL PRIMARY KEY,
+            tournament_id INTEGER REFERENCES tournaments(id) ON DELETE CASCADE,
+            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            status TEXT DEFAULT 'active',
+            wo_count INTEGER DEFAULT 0,
+            UNIQUE(tournament_id, user_id)
+        )
+        """)
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS matches (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        tournament_id INTEGER,
-        round_id INTEGER,
-        white_user_id INTEGER,
-        black_user_id INTEGER,
-        status TEXT DEFAULT 'pending',
-        result TEXT,
-        result_type TEXT DEFAULT 'normal',
-        chesscom_url TEXT,
-        game_uuid TEXT,
-        locked INTEGER DEFAULT 0,
-        detected_at TEXT,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS matches (
+            id SERIAL PRIMARY KEY,
+            tournament_id INTEGER REFERENCES tournaments(id) ON DELETE CASCADE,
+            round_id INTEGER REFERENCES rounds(id) ON DELETE CASCADE,
+            white_user_id INTEGER REFERENCES users(id),
+            black_user_id INTEGER REFERENCES users(id),
+            status TEXT DEFAULT 'pending',
+            result TEXT,
+            result_type TEXT DEFAULT 'normal',
+            chesscom_url TEXT,
+            game_uuid TEXT,
+            locked INTEGER DEFAULT 0,
+            detected_at TIMESTAMP,
+            review_game_uuid TEXT,
+            review_url TEXT,
+            review_result TEXT,
+            rejected_game_uuid TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS elo_history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        match_id INTEGER,
-        user_id INTEGER,
-        old_elo INTEGER,
-        new_elo INTEGER,
-        delta INTEGER,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS elo_history (
+            id SERIAL PRIMARY KEY,
+            match_id INTEGER,
+            user_id INTEGER,
+            old_elo INTEGER,
+            new_elo INTEGER,
+            delta INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS audit_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        action TEXT,
-        detail TEXT,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER,
+            action TEXT,
+            detail TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+    else:
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE,
+            password_hash TEXT,
+            chesscom_user TEXT UNIQUE,
+            display_name TEXT,
+            role TEXT DEFAULT 'player',
+            elo INTEGER DEFAULT 1200,
+            avatar_url TEXT,
+            account_status TEXT DEFAULT 'pending',
+            must_change_password INTEGER DEFAULT 1,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
 
-    conn.commit()
-    conn.close()
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS chess_aliases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            alias TEXT UNIQUE,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
 
-    # Safe migrations if previous DB exists
-    migrations = [
-        ("users", "avatar_url", "TEXT"),
-        ("users", "account_status", "TEXT DEFAULT 'pending'"),
-        ("users", "must_change_password", "INTEGER DEFAULT 1"),
-        ("tournaments", "playoff_rules", "TEXT DEFAULT 'chess'"),
-        ("tournaments", "playoff_time_class", "TEXT DEFAULT 'blitz'"),
-        ("tournaments", "playoff_time_control", "TEXT DEFAULT '300'"),
-        ("tournaments", "tournament_type", "TEXT DEFAULT 'fixture'"),
-        ("tournaments", "rules", "TEXT DEFAULT 'chess'"),
-        ("tournaments", "time_class", "TEXT DEFAULT 'blitz'"),
-        ("tournaments", "time_control", "TEXT DEFAULT '600'"),
-        ("tournaments", "rated_filter", "TEXT DEFAULT 'any'"),
-        ("tournaments", "strict_colors", "INTEGER DEFAULT 1"),
-        ("tournaments", "playoff_rules", "TEXT DEFAULT 'chess'"),
-        ("tournaments", "playoff_time_class", "TEXT DEFAULT 'blitz'"),
-        ("tournaments", "playoff_time_control", "TEXT DEFAULT '300'"),
-        ("tournaments", "playoff_rated_filter", "TEXT DEFAULT 'any'"),
-        ("tournaments", "created_by", "INTEGER"),
-        ("registrations", "status", "TEXT DEFAULT 'active'"),
-        ("registrations", "wo_count", "INTEGER DEFAULT 0"),
-        ("matches", "result_type", "TEXT DEFAULT 'normal'"),
-        ("matches", "locked", "INTEGER DEFAULT 0"),
-        ("matches", "detected_at", "TEXT"),
-        ("matches", "review_game_uuid", "TEXT"),
-        ("matches", "review_url", "TEXT"),
-        ("matches", "review_result", "TEXT"),
-        ("matches", "rejected_game_uuid", "TEXT"),
-    ]
-    for table, col, definition in migrations:
-        ensure_column(table, col, definition)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS tournaments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            description TEXT,
+            status TEXT DEFAULT 'open',
+            tournament_type TEXT DEFAULT 'fixture',
+            rules TEXT DEFAULT 'chess',
+            time_class TEXT DEFAULT 'rapid',
+            time_control TEXT DEFAULT '600',
+            rated_filter TEXT DEFAULT 'any',
+            strict_colors INTEGER DEFAULT 1,
+            playoff_rules TEXT DEFAULT 'chess',
+            playoff_time_class TEXT DEFAULT 'blitz',
+            playoff_time_control TEXT DEFAULT '300',
+            playoff_rated_filter TEXT DEFAULT 'any',
+            created_by INTEGER,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS rounds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tournament_id INTEGER,
+            number INTEGER,
+            start_datetime TEXT,
+            end_datetime TEXT,
+            status TEXT DEFAULT 'active'
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS registrations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tournament_id INTEGER,
+            user_id INTEGER,
+            status TEXT DEFAULT 'active',
+            wo_count INTEGER DEFAULT 0,
+            UNIQUE(tournament_id, user_id)
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS matches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tournament_id INTEGER,
+            round_id INTEGER,
+            white_user_id INTEGER,
+            black_user_id INTEGER,
+            status TEXT DEFAULT 'pending',
+            result TEXT,
+            result_type TEXT DEFAULT 'normal',
+            chesscom_url TEXT,
+            game_uuid TEXT,
+            locked INTEGER DEFAULT 0,
+            detected_at TEXT,
+            review_game_uuid TEXT,
+            review_url TEXT,
+            review_result TEXT,
+            rejected_game_uuid TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS elo_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            match_id INTEGER,
+            user_id INTEGER,
+            old_elo INTEGER,
+            new_elo INTEGER,
+            delta INTEGER,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            action TEXT,
+            detail TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+
+    c.commit()
+    c.close()
+
+
+def insert_returning(table, cols, values):
+    placeholders = ", ".join(["?"] * len(values))
+    coltxt = ", ".join(cols)
+
+    if use_postgres():
+        sql = f"INSERT INTO {table} ({coltxt}) VALUES ({placeholders}) RETURNING id"
+        return exec_sql(sql, values)
+
+    sql = f"INSERT INTO {table} ({coltxt}) VALUES ({placeholders})"
+    return exec_sql(sql, values)
 
 
 # =========================================================
-# Helpers / users
+# GENERAL HELPERS
 # =========================================================
 
 def norm(value):
@@ -227,13 +361,9 @@ def norm(value):
 
 def valid_chess_username(value):
     value = norm(value)
-    if not value:
+    if not value or value in {"0", "nan", "none", "null", "-"}:
         return False
-    if value in {"0", "nan", "none", "null", "-"}:
-        return False
-    if len(value) < 2:
-        return False
-    return True
+    return len(value) >= 2
 
 
 def hash_password(password):
@@ -254,16 +384,18 @@ def is_superadmin(user):
 
 def get_user(user_id):
     row = q("SELECT * FROM users WHERE id=?", (user_id,), one=True)
-    return dict(row) if row else None
+    return row
 
 
 def audit(user_id, action, detail=""):
-    exec_sql(
-        "INSERT INTO audit_log(user_id, action, detail) VALUES(?,?,?)",
-        (user_id, action, detail),
-    )
+    insert_returning("audit_log", ["user_id", "action", "detail"], [user_id, action, detail])
 
 
+# =========================================================
+# CHESS.COM
+# =========================================================
+
+@st.cache_data(ttl=300)
 def chess_profile(username):
     try:
         r = requests.get(f"{API_BASE}/player/{norm(username)}", headers=HEADERS, timeout=20)
@@ -272,7 +404,6 @@ def chess_profile(username):
     except Exception:
         return None
     return None
-
 
 
 def chess_user_exists(chesscom_user):
@@ -285,176 +416,15 @@ def sync_avatar(user_id, chesscom_user):
         exec_sql("UPDATE users SET avatar_url=? WHERE id=?", (profile.get("avatar"), user_id))
 
 
-def get_or_create_player(chesscom_user, display_name=None):
-    chesscom_user = norm(chesscom_user)
-    if not valid_chess_username(chesscom_user):
-        raise ValueError(f"Usuario Chess.com inválido: {chesscom_user}")
-
-    row = q("SELECT * FROM users WHERE chesscom_user=?", (chesscom_user,), one=True)
-    if row:
-        return row["id"], False
-
-    username = chesscom_user
-    if q("SELECT id FROM users WHERE username=?", (username,), one=True):
-        username = f"{chesscom_user}_{dt.datetime.now().strftime('%H%M%S')}"
-
-    user_id = exec_sql("""
-        INSERT INTO users(username, password_hash, chesscom_user, display_name, role, elo, account_status, must_change_password)
-        VALUES(?,?,?,?,?,?,?,?)
-    """, (
-        username,
-        hash_password(DEFAULT_PASSWORD),
-        chesscom_user,
-        display_name or chesscom_user,
-        "player",
-        1200,
-        "pending",
-        1,
-    ))
-    sync_avatar(user_id, chesscom_user)
-    return user_id, True
-
-
-
-def add_chess_alias(user_id, alias):
-    alias = norm(alias)
-    if not valid_chess_username(alias):
-        raise ValueError("Alias inválido.")
-    exec_sql("INSERT OR IGNORE INTO chess_aliases(user_id, alias) VALUES(?,?)", (user_id, alias))
-
-
-def username_belongs_to_user(chess_name, user_id):
-    chess_name = norm(chess_name)
-    user = get_user(user_id)
-    if user and norm(user["chesscom_user"]) == chess_name:
-        return True
-    alias = q("SELECT id FROM chess_aliases WHERE user_id=? AND alias=?", (user_id, chess_name), one=True)
-    return alias is not None
-
-
-def update_user_chess(user_id, new_chess, new_display=None, add_old_as_alias=True):
-    new_chess = norm(new_chess)
-    if not valid_chess_username(new_chess):
-        raise ValueError("Usuario Chess.com inválido.")
-
-    user = get_user(user_id)
-    if not user:
-        raise ValueError("Usuario no encontrado.")
-
-    old_chess = norm(user["chesscom_user"])
-    existing = q("SELECT id FROM users WHERE chesscom_user=? AND id<>?", (new_chess, user_id), one=True)
-    if existing:
-        raise ValueError("Ese usuario Chess.com ya pertenece a otro perfil.")
-
-    if add_old_as_alias and valid_chess_username(old_chess) and old_chess != new_chess:
-        add_chess_alias(user_id, old_chess)
-
-    display = new_display.strip() if new_display else user["display_name"]
-    exec_sql("""
-        UPDATE users
-        SET chesscom_user=?, username=?, display_name=?
-        WHERE id=?
-    """, (new_chess, new_chess, display, user_id))
-    sync_avatar(user_id, new_chess)
-
-def create_or_claim_user(username, password, chesscom_user, display_name):
-    username = norm(username) or norm(chesscom_user)
-    chesscom_user = norm(chesscom_user)
-    if not chess_user_exists(chesscom_user):
-        raise ValueError("Ese usuario no existe en Chess.com. Usá tu usuario real de Chess.com.")
-    display_name = display_name.strip() if display_name else username
-
-    count = q("SELECT COUNT(*) c FROM users", one=True)["c"]
-    existing = q("SELECT * FROM users WHERE chesscom_user=?", (chesscom_user,), one=True)
-
-    if existing:
-        exec_sql("""
-            UPDATE users
-            SET username=?, password_hash=?, display_name=?, account_status='active', must_change_password=0
-            WHERE id=?
-        """, (username, hash_password(password), display_name, existing["id"]))
-        sync_avatar(existing["id"], chesscom_user)
-        return existing["id"]
-
-    role = "superadmin" if count == 0 else "player"
-    user_id = exec_sql("""
-        INSERT INTO users(username, password_hash, chesscom_user, display_name, role, elo, account_status, must_change_password)
-        VALUES(?,?,?,?,?,?,?,?)
-    """, (
-        username,
-        hash_password(password),
-        chesscom_user,
-        display_name,
-        role,
-        1200,
-        "active",
-        0,
-    ))
-    sync_avatar(user_id, chesscom_user)
-    return user_id
-
-
-def login(username, password):
-    username = norm(username)
-    row = q("SELECT * FROM users WHERE username=? OR chesscom_user=?", (username, username), one=True)
-    if not row:
-        return None, "Usuario no encontrado."
-    if row["account_status"] == "suspended":
-        return None, "Usuario suspendido."
-    if row["password_hash"] != hash_password(password):
-        return None, "Contraseña incorrecta."
-
-    if row["account_status"] == "pending":
-        exec_sql("UPDATE users SET account_status='active' WHERE id=?", (row["id"],))
-        row = q("SELECT * FROM users WHERE id=?", (row["id"],), one=True)
-
-    return dict(row), None
-
-
-def update_password(user_id, new_password, must_change=0):
-    exec_sql("""
-        UPDATE users
-        SET password_hash=?, must_change_password=?, account_status='active'
-        WHERE id=?
-    """, (hash_password(new_password), must_change, user_id))
-
-
-# =========================================================
-# CSV
-# =========================================================
-
-def read_uploaded_csv(file):
-    raw = file.getvalue()
-    encodings = ["utf-8", "utf-8-sig", "latin-1", "cp1252"]
-    separators = [",", ";", "\t"]
-
-    last_error = None
-    for enc in encodings:
-        for sep in separators:
-            try:
-                text = raw.decode(enc)
-                df = pd.read_csv(io.StringIO(text), sep=sep)
-                if len(df.columns) > 1:
-                    df.columns = [str(c).strip() for c in df.columns]
-                    return df
-            except Exception as exc:
-                last_error = exc
-
-    raise Exception(f"No pude leer el CSV. Guardalo como CSV UTF-8 o CSV con punto y coma. Último error: {last_error}")
-
-
-# =========================================================
-# Chess.com
-# =========================================================
-
+@st.cache_data(ttl=60)
 def chess_archives(username):
     try:
         r = requests.get(f"{API_BASE}/player/{norm(username)}/games/archives", headers=HEADERS, timeout=20)
-        if r.status_code != 200:
-            return []
-        return r.json().get("archives", [])
+        if r.status_code == 200:
+            return r.json().get("archives", [])
     except Exception:
-        return []
+        pass
+    return []
 
 
 def month_keys_between(start_dt, end_dt):
@@ -473,7 +443,7 @@ def chess_games_between(username, start_dt, end_dt):
     games = []
     keys = month_keys_between(start_dt, end_dt)
     for url in chess_archives(username):
-        if any(key in url for key in keys):
+        if any(k in url for k in keys):
             try:
                 r = requests.get(url, headers=HEADERS, timeout=20)
                 if r.status_code == 200:
@@ -490,56 +460,205 @@ def parse_ts(timestamp):
         return None
 
 
-def validate_game(game, white_user, black_user, tournament, start_dt, end_dt):
-    white = norm(game.get("white", {}).get("username"))
-    black = norm(game.get("black", {}).get("username"))
+# =========================================================
+# USERS / ALIASES
+# =========================================================
 
-    # white_user / black_user are user IDs in V7.2 validator wrapper when possible
-    if isinstance(white_user, int) and isinstance(black_user, int):
-        white_ok = username_belongs_to_user(white, white_user)
-        black_ok = username_belongs_to_user(black, black_user)
-        white_inv = username_belongs_to_user(white, black_user)
-        black_inv = username_belongs_to_user(black, white_user)
-    else:
-        white_ok = white == norm(white_user)
-        black_ok = black == norm(black_user)
-        white_inv = white == norm(black_user)
-        black_inv = black == norm(white_user)
+def add_chess_alias(user_id, alias):
+    alias = norm(alias)
+    if not valid_chess_username(alias):
+        raise ValueError("Alias inválido.")
+    insert_returning("chess_aliases", ["user_id", "alias"], [user_id, alias])
 
-    if tournament["strict_colors"]:
-        if not (white_ok and black_ok):
-            if white_inv and black_inv:
-                return False, "colores invertidos"
-            return False, "colores/usuarios no coinciden"
-    else:
-        if not ((white_ok and black_ok) or (white_inv and black_inv)):
-            return False, "usuarios no coinciden"
 
-    if game.get("rules") != tournament["rules"]:
-        return False, f"modalidad distinta: {game.get('rules')}"
+def username_belongs_to_user(chess_name, user_id):
+    chess_name = norm(chess_name)
+    user = get_user(user_id)
+    if user and norm(user["chesscom_user"]) == chess_name:
+        return True
+    alias = q("SELECT id FROM chess_aliases WHERE user_id=? AND alias=?", (user_id, chess_name), one=True)
+    return alias is not None
 
-    if game.get("time_class") != tournament["time_class"]:
-        return False, f"clase distinta: {game.get('time_class')}"
 
-    if str(game.get("time_control")) != str(tournament["time_control"]):
-        return False, f"ritmo distinto: {game.get('time_control')}"
+def update_user_chess(user_id, new_chess, new_display=None, add_old_as_alias=True):
+    new_chess = norm(new_chess)
+    if not valid_chess_username(new_chess):
+        raise ValueError("Usuario Chess.com inválido.")
+    if not chess_user_exists(new_chess):
+        raise ValueError("Ese usuario no existe en Chess.com.")
 
-    if tournament["rated_filter"] == "rated" and not game.get("rated"):
-        return False, "no es rated"
+    user = get_user(user_id)
+    if not user:
+        raise ValueError("Usuario no encontrado.")
 
-    if tournament["rated_filter"] == "casual" and game.get("rated"):
-        return False, "no es casual"
+    existing = q("SELECT id FROM users WHERE chesscom_user=? AND id<>?", (new_chess, user_id), one=True)
+    if existing:
+        raise ValueError("Ese Chess.com ya pertenece a otro perfil.")
 
-    started = parse_ts(game.get("start_time") or game.get("end_time"))
-    if not started:
-        return False, "sin fecha detectable"
+    old_chess = norm(user["chesscom_user"])
+    if add_old_as_alias and valid_chess_username(old_chess) and old_chess != new_chess:
+        add_chess_alias(user_id, old_chess)
 
-    if started < start_dt:
-        return False, "anterior al rango"
-    if started > end_dt:
-        return False, "posterior al rango"
+    display = new_display.strip() if new_display else user["display_name"]
+    exec_sql("UPDATE users SET username=?, chesscom_user=?, display_name=? WHERE id=?", (new_chess, new_chess, display, user_id))
+    sync_avatar(user_id, new_chess)
 
-    return True, "ok"
+
+def get_or_create_player(chesscom_user, display_name=None, validate_exists=False):
+    chesscom_user = norm(chesscom_user)
+    if not valid_chess_username(chesscom_user):
+        raise ValueError(f"Usuario Chess.com inválido: {chesscom_user}")
+
+    if validate_exists and not chess_user_exists(chesscom_user):
+        raise ValueError(f"{chesscom_user} no existe en Chess.com.")
+
+    row = q("SELECT * FROM users WHERE chesscom_user=?", (chesscom_user,), one=True)
+    if row:
+        return row["id"], False
+
+    username = chesscom_user
+    if q("SELECT id FROM users WHERE username=?", (username,), one=True):
+        username = f"{chesscom_user}_{dt.datetime.now().strftime('%H%M%S')}"
+
+    user_id = insert_returning(
+        "users",
+        ["username", "password_hash", "chesscom_user", "display_name", "role", "elo", "account_status", "must_change_password"],
+        [username, hash_password(DEFAULT_PASSWORD), chesscom_user, display_name or chesscom_user, "player", 1200, "pending", 1],
+    )
+    sync_avatar(user_id, chesscom_user)
+    return user_id, True
+
+
+def create_or_claim_user(username, password, chesscom_user, display_name):
+    username = norm(username) or norm(chesscom_user)
+    chesscom_user = norm(chesscom_user)
+
+    if not chess_user_exists(chesscom_user):
+        raise ValueError("Ese usuario no existe en Chess.com. Usá tu usuario real de Chess.com.")
+
+    display_name = display_name.strip() if display_name else username
+    count = q("SELECT COUNT(*) AS c FROM users", one=True)["c"]
+
+    existing = q("SELECT * FROM users WHERE chesscom_user=?", (chesscom_user,), one=True)
+    if existing:
+        exec_sql("""
+            UPDATE users
+            SET username=?, password_hash=?, display_name=?, account_status='active', must_change_password=0
+            WHERE id=?
+        """, (username, hash_password(password), display_name, existing["id"]))
+        sync_avatar(existing["id"], chesscom_user)
+        return existing["id"]
+
+    role = "superadmin" if count == 0 else "player"
+    user_id = insert_returning(
+        "users",
+        ["username", "password_hash", "chesscom_user", "display_name", "role", "elo", "account_status", "must_change_password"],
+        [username, hash_password(password), chesscom_user, display_name, role, 1200, "active", 0],
+    )
+    sync_avatar(user_id, chesscom_user)
+    return user_id
+
+
+def login(username, password):
+    username = norm(username)
+    user = q("SELECT * FROM users WHERE username=? OR chesscom_user=?", (username, username), one=True)
+    if not user:
+        return None, "Usuario no encontrado."
+    if user["account_status"] == "suspended":
+        return None, "Usuario suspendido."
+    if user["password_hash"] != hash_password(password):
+        return None, "Contraseña incorrecta."
+
+    if user["account_status"] == "pending":
+        exec_sql("UPDATE users SET account_status='active' WHERE id=?", (user["id"],))
+        user = get_user(user["id"])
+
+    return user, None
+
+
+def update_password(user_id, new_password, must_change=0):
+    exec_sql("""
+        UPDATE users
+        SET password_hash=?, must_change_password=?, account_status='active'
+        WHERE id=?
+    """, (hash_password(new_password), must_change, user_id))
+
+
+# =========================================================
+# CSV / DATE PARSING
+# =========================================================
+
+def read_uploaded_csv(file):
+    raw = file.getvalue()
+    encodings = ["utf-8", "utf-8-sig", "latin-1", "cp1252"]
+    seps = [",", ";", "\t"]
+    last_error = None
+
+    for enc in encodings:
+        for sep in seps:
+            try:
+                text = raw.decode(enc)
+                df = pd.read_csv(io.StringIO(text), sep=sep)
+                if len(df.columns) > 1:
+                    df.columns = [str(c).strip() for c in df.columns]
+                    return df
+            except Exception as exc:
+                last_error = exc
+
+    raise Exception(f"No pude leer el CSV. Guardalo como CSV UTF-8 o separado por punto y coma. Error: {last_error}")
+
+
+def parse_date_series(series):
+    # dayfirst=True para Argentina: 03/04/2026 = 3 de abril
+    return pd.to_datetime(series, errors="coerce", dayfirst=True)
+
+
+def to_iso(value):
+    if isinstance(value, str):
+        return value
+    if isinstance(value, pd.Timestamp):
+        return value.to_pydatetime().isoformat(timespec="seconds")
+    if isinstance(value, dt.datetime):
+        return value.isoformat(timespec="seconds")
+    return str(value)
+
+
+def parse_db_datetime(value):
+    if isinstance(value, dt.datetime):
+        return value
+    return dt.datetime.fromisoformat(str(value).replace("Z", "+00:00").replace("+00:00", ""))
+
+
+# =========================================================
+# ELO / RESULTS
+# =========================================================
+
+def expected_score(ra, rb):
+    return 1 / (1 + 10 ** ((rb - ra) / 400))
+
+
+def elo_delta(ra, rb, score, k=32):
+    return round(k * (score - expected_score(ra, rb)))
+
+
+def result_label(score):
+    if score == 1.0:
+        return "1-0"
+    if score == 0.0:
+        return "0-1"
+    if score == 0.5:
+        return "1/2-1/2"
+    return ""
+
+
+def score_from_result_label(result):
+    if result == "1-0":
+        return 1.0
+    if result == "0-1":
+        return 0.0
+    if result == "1/2-1/2":
+        return 0.5
+    return None
 
 
 def score_for_white(game):
@@ -556,333 +675,26 @@ def score_for_white(game):
     return None
 
 
-def result_label(score):
-    if score == 1.0:
-        return "1-0"
-    if score == 0.0:
-        return "0-1"
-    if score == 0.5:
-        return "1/2-1/2"
-    return ""
-
-
-# =========================================================
-# ELO / standings
-# =========================================================
-
-def expected_score(ra, rb):
-    return 1 / (1 + 10 ** ((rb - ra) / 400))
-
-
-def elo_delta(ra, rb, score, k=32):
-    return round(k * (score - expected_score(ra, rb)))
-
-
 def apply_elo(match_id, white_id, black_id, white_score):
-    white_user = get_user(white_id)
-    black_user = get_user(black_id)
-    if not white_user or not black_user:
+    white = get_user(white_id)
+    black = get_user(black_id)
+    if not white or not black:
         return
 
     black_score = 1 - white_score if white_score in (0, 1) else 0.5
-    dw = elo_delta(white_user["elo"], black_user["elo"], white_score)
-    db = elo_delta(black_user["elo"], white_user["elo"], black_score)
+    dw = elo_delta(white["elo"], black["elo"], white_score)
+    db = elo_delta(black["elo"], white["elo"], black_score)
 
-    exec_sql("UPDATE users SET elo=? WHERE id=?", (white_user["elo"] + dw, white_id))
-    exec_sql("UPDATE users SET elo=? WHERE id=?", (black_user["elo"] + db, black_id))
-    exec_sql("INSERT INTO elo_history(match_id,user_id,old_elo,new_elo,delta) VALUES(?,?,?,?,?)",
-             (match_id, white_id, white_user["elo"], white_user["elo"] + dw, dw))
-    exec_sql("INSERT INTO elo_history(match_id,user_id,old_elo,new_elo,delta) VALUES(?,?,?,?,?)",
-             (match_id, black_id, black_user["elo"], black_user["elo"] + db, db))
+    exec_sql("UPDATE users SET elo=? WHERE id=?", (white["elo"] + dw, white_id))
+    exec_sql("UPDATE users SET elo=? WHERE id=?", (black["elo"] + db, black_id))
 
-
-def standings(tournament_id):
-    regs = q("""
-        SELECT u.id, u.display_name, u.chesscom_user, u.elo, r.status, r.wo_count
-        FROM registrations r
-        JOIN users u ON u.id=r.user_id
-        WHERE r.tournament_id=? AND r.status!='removed'
-    """, (tournament_id,))
-
-    table = []
-    for user in regs:
-        matches = q("""
-            SELECT * FROM matches
-            WHERE tournament_id=? AND status='finished'
-            AND (white_user_id=? OR black_user_id=?)
-        """, (tournament_id, user["id"], user["id"]))
-
-        pts = wins = draws = losses = wo = 0
-        for match in matches:
-            if match["result_type"] == "wo":
-                wo += 1
-                continue
-
-            if match["white_user_id"] == user["id"]:
-                if match["result"] == "1-0":
-                    pts += 1
-                    wins += 1
-                elif match["result"] == "0-1":
-                    losses += 1
-                elif match["result"] == "1/2-1/2":
-                    pts += 0.5
-                    draws += 1
-            else:
-                if match["result"] == "0-1":
-                    pts += 1
-                    wins += 1
-                elif match["result"] == "1-0":
-                    losses += 1
-                elif match["result"] == "1/2-1/2":
-                    pts += 0.5
-                    draws += 1
-
-        table.append({
-            "Jugador": user["display_name"],
-            "Chess.com": user["chesscom_user"],
-            "ELO": user["elo"],
-            "PJ": len(matches),
-            "G": wins,
-            "E": draws,
-            "P": losses,
-            "WO": user["wo_count"],
-            "Estado": user["status"],
-            "Puntos": pts,
-        })
-
-    table.sort(key=lambda row: (row["Estado"] != "disqualified", row["Puntos"], row["ELO"], row["G"]), reverse=True)
-    return table
-
-
-def player_stats(user_id):
-    matches = q("""
-        SELECT * FROM matches
-        WHERE status='finished' AND (white_user_id=? OR black_user_id=?)
-    """, (user_id, user_id))
-
-    pts = wins = draws = losses = wo = 0
-    for match in matches:
-        if match["result_type"] == "wo":
-            wo += 1
-            continue
-        if match["white_user_id"] == user_id:
-            if match["result"] == "1-0":
-                pts += 1
-                wins += 1
-            elif match["result"] == "0-1":
-                losses += 1
-            elif match["result"] == "1/2-1/2":
-                pts += 0.5
-                draws += 1
-        else:
-            if match["result"] == "0-1":
-                pts += 1
-                wins += 1
-            elif match["result"] == "1-0":
-                losses += 1
-            elif match["result"] == "1/2-1/2":
-                pts += 0.5
-                draws += 1
-
-    perf = round((pts / len(matches)) * 100, 1) if matches else 0
-    return {"PJ": len(matches), "G": wins, "E": draws, "P": losses, "WO": wo, "Puntos": pts, "Rendimiento": perf}
+    insert_returning("elo_history", ["match_id", "user_id", "old_elo", "new_elo", "delta"], [match_id, white_id, white["elo"], white["elo"] + dw, dw])
+    insert_returning("elo_history", ["match_id", "user_id", "old_elo", "new_elo", "delta"], [match_id, black_id, black["elo"], black["elo"] + db, db])
 
 
 # =========================================================
-# Tournament actions
+# MATCH DETECTION
 # =========================================================
-
-def register_player(tournament_id, user_id):
-    exec_sql("""
-        INSERT OR IGNORE INTO registrations(tournament_id,user_id,status,wo_count)
-        VALUES(?,?,?,?)
-    """, (tournament_id, user_id, "active", 0))
-
-
-def import_fixture_csv(df, created_by, rules, time_class, time_control, rated_filter, strict_colors):
-    required = {"torneo", "ronda", "fecha_inicio", "fecha_fin", "blancas_chesscom", "negras_chesscom"}
-    missing = required - set(df.columns)
-    if missing:
-        raise Exception(f"Faltan columnas: {', '.join(sorted(missing))}")
-
-    created_matches = 0
-    created_players = 0
-
-    for tournament_name, group in df.groupby("torneo"):
-        tournament_name = str(tournament_name).strip()
-        if not tournament_name:
-            continue
-
-        tournament_id = exec_sql("""
-            INSERT INTO tournaments(name,description,status,tournament_type,rules,time_class,time_control,rated_filter,strict_colors,created_by)
-            VALUES(?,?,?,?,?,?,?,?,?,?)
-        """, (
-            tournament_name,
-            "Fixture importado para detección automática",
-            "playing",
-            "fixture_importado",
-            rules,
-            time_class,
-            str(time_control),
-            rated_filter,
-            1 if strict_colors else 0,
-            created_by,
-        ))
-
-        for round_number, round_df in group.groupby("ronda"):
-            round_number = int(round_number)
-            start_value = pd.to_datetime(round_df["fecha_inicio"], errors="coerce").min()
-            end_value = pd.to_datetime(round_df["fecha_fin"], errors="coerce").max()
-
-            if pd.isna(start_value) or pd.isna(end_value):
-                continue
-
-            round_id = exec_sql("""
-                INSERT INTO rounds(tournament_id,number,start_datetime,end_datetime,status)
-                VALUES(?,?,?,?,?)
-            """, (
-                tournament_id,
-                round_number,
-                start_value.to_pydatetime().isoformat(timespec="seconds"),
-                end_value.to_pydatetime().isoformat(timespec="seconds"),
-                "active",
-            ))
-
-            for _, row in round_df.iterrows():
-                white_raw = norm(row["blancas_chesscom"])
-                black_raw = norm(row["negras_chesscom"])
-                if not valid_chess_username(white_raw) or not valid_chess_username(black_raw):
-                    continue
-                white_id, white_created = get_or_create_player(white_raw)
-                black_id, black_created = get_or_create_player(black_raw)
-                created_players += int(white_created) + int(black_created)
-
-                register_player(tournament_id, white_id)
-                register_player(tournament_id, black_id)
-
-                exec_sql("""
-                    INSERT INTO matches(tournament_id,round_id,white_user_id,black_user_id,status,locked)
-                    VALUES(?,?,?,?,?,?)
-                """, (tournament_id, round_id, white_id, black_id, "pending", 0))
-                created_matches += 1
-
-    audit(created_by, "import_fixture", f"matches={created_matches}, players={created_players}")
-    return created_matches, created_players
-
-
-
-def create_empty_tournament(name, description, rules, time_class, time_control, rated_filter, strict_colors, created_by):
-    return exec_sql("""
-        INSERT INTO tournaments(name,description,status,tournament_type,rules,time_class,time_control,rated_filter,strict_colors,created_by)
-        VALUES(?,?,?,?,?,?,?,?,?,?)
-    """, (
-        name,
-        description,
-        "open",
-        "manual",
-        rules,
-        time_class,
-        str(time_control),
-        rated_filter,
-        1 if strict_colors else 0,
-        created_by,
-    ))
-
-
-def import_rounds_to_existing_tournament(df, tournament_id):
-    required = {"ronda", "fecha_inicio", "fecha_fin", "blancas_chesscom", "negras_chesscom"}
-    missing = required - set(df.columns)
-    if missing:
-        raise Exception(f"Faltan columnas: {', '.join(sorted(missing))}")
-
-    created_matches = 0
-    created_players = 0
-
-    for round_number, round_df in df.groupby("ronda"):
-        round_number = int(round_number)
-        start_value = pd.to_datetime(round_df["fecha_inicio"], errors="coerce").min()
-        end_value = pd.to_datetime(round_df["fecha_fin"], errors="coerce").max()
-
-        if pd.isna(start_value) or pd.isna(end_value):
-            continue
-
-        existing_round = q(
-            "SELECT id FROM rounds WHERE tournament_id=? AND number=?",
-            (tournament_id, round_number),
-            one=True,
-        )
-
-        if existing_round:
-            round_id = existing_round["id"]
-            exec_sql(
-                "UPDATE rounds SET start_datetime=?, end_datetime=? WHERE id=?",
-                (
-                    start_value.to_pydatetime().isoformat(timespec="seconds"),
-                    end_value.to_pydatetime().isoformat(timespec="seconds"),
-                    round_id,
-                ),
-            )
-        else:
-            round_id = exec_sql("""
-                INSERT INTO rounds(tournament_id,number,start_datetime,end_datetime,status)
-                VALUES(?,?,?,?,?)
-            """, (
-                tournament_id,
-                round_number,
-                start_value.to_pydatetime().isoformat(timespec="seconds"),
-                end_value.to_pydatetime().isoformat(timespec="seconds"),
-                "active",
-            ))
-
-        for _, row in round_df.iterrows():
-            white_raw = norm(row["blancas_chesscom"])
-            black_raw = norm(row["negras_chesscom"])
-            if not valid_chess_username(white_raw) or not valid_chess_username(black_raw):
-                continue
-            white_id, white_created = get_or_create_player(white_raw)
-            black_id, black_created = get_or_create_player(black_raw)
-
-            created_players += int(white_created) + int(black_created)
-
-            register_player(tournament_id, white_id)
-            register_player(tournament_id, black_id)
-
-            exists = q("""
-                SELECT id FROM matches
-                WHERE tournament_id=? AND round_id=? AND white_user_id=? AND black_user_id=?
-            """, (tournament_id, round_id, white_id, black_id), one=True)
-
-            if exists:
-                continue
-
-            exec_sql("""
-                INSERT INTO matches(tournament_id,round_id,white_user_id,black_user_id,status,locked)
-                VALUES(?,?,?,?,?,?)
-            """, (tournament_id, round_id, white_id, black_id, "pending", 0))
-            created_matches += 1
-
-    exec_sql("UPDATE tournaments SET status='playing' WHERE id=?", (tournament_id,))
-    return created_matches, created_players
-
-
-
-
-def score_for_fixture_white(game, fixture_white_user_id, fixture_black_user_id):
-    actual_white = norm(game.get("white", {}).get("username"))
-    actual_score_white = score_for_white(game)
-    if actual_score_white is None:
-        return None
-
-    if username_belongs_to_user(actual_white, fixture_white_user_id):
-        return actual_score_white
-
-    if username_belongs_to_user(actual_white, fixture_black_user_id):
-        if actual_score_white == 0.5:
-            return 0.5
-        return 1.0 - actual_score_white
-
-    return None
-
 
 def game_is_between_players_any_color(game, white_user_id, black_user_id):
     actual_white = norm(game.get("white", {}).get("username"))
@@ -890,7 +702,6 @@ def game_is_between_players_any_color(game, white_user_id, black_user_id):
 
     exact = username_belongs_to_user(actual_white, white_user_id) and username_belongs_to_user(actual_black, black_user_id)
     inverted = username_belongs_to_user(actual_white, black_user_id) and username_belongs_to_user(actual_black, white_user_id)
-
     return exact, inverted
 
 
@@ -922,13 +733,29 @@ def validate_game_without_color(game, tournament, start_dt, end_dt):
     return True, "ok"
 
 
+def score_for_fixture_white(game, fixture_white_user_id, fixture_black_user_id):
+    actual_white = norm(game.get("white", {}).get("username"))
+    actual_score_white = score_for_white(game)
+    if actual_score_white is None:
+        return None
+
+    if username_belongs_to_user(actual_white, fixture_white_user_id):
+        return actual_score_white
+
+    if username_belongs_to_user(actual_white, fixture_black_user_id):
+        if actual_score_white == 0.5:
+            return 0.5
+        return 1.0 - actual_score_white
+
+    return None
+
+
 def mark_color_review(match, game):
     score = score_for_fixture_white(game, match["white_user_id"], match["black_user_id"])
     if score is None:
         return False
 
     result = result_label(score)
-
     exec_sql("""
         UPDATE matches
         SET status='review', result=?, result_type='color_review',
@@ -942,32 +769,256 @@ def mark_color_review(match, game):
         result,
         game.get("url"),
         game.get("uuid"),
-        dt.datetime.now().isoformat(timespec="seconds"),
+        dt.datetime.now(),
         match["id"],
     ))
-
     return True
+
+
+def scan_tournament(tournament_id):
+    tournament = q("SELECT * FROM tournaments WHERE id=?", (tournament_id,), one=True)
+    if not tournament:
+        return 0, [{"Cruce": "-", "Estado": "torneo no encontrado"}]
+
+    pending = q("""
+        SELECT m.*, r.number, r.start_datetime, r.end_datetime,
+               wu.chesscom_user AS white_chess,
+               bu.chesscom_user AS black_chess
+        FROM matches m
+        JOIN rounds r ON r.id=m.round_id
+        JOIN users wu ON wu.id=m.white_user_id
+        JOIN users bu ON bu.id=m.black_user_id
+        WHERE m.tournament_id=? AND m.status='pending' AND m.locked=0
+    """, (tournament_id,))
+
+    found = 0
+    debug = []
+
+    for match in pending:
+        start_dt = parse_db_datetime(match["start_datetime"])
+        end_dt = parse_db_datetime(match["end_datetime"])
+
+        white_exists = chess_user_exists(match["white_chess"])
+        black_exists = chess_user_exists(match["black_chess"])
+
+        if not white_exists or not black_exists:
+            missing = []
+            if not white_exists:
+                missing.append(match["white_chess"])
+            if not black_exists:
+                missing.append(match["black_chess"])
+            debug.append({"Cruce": f"{match['white_chess']} vs {match['black_chess']}", "Estado": "usuario inexistente en Chess.com: " + ", ".join(missing)})
+            continue
+
+        games = chess_games_between(match["white_chess"], start_dt, end_dt)
+        games += chess_games_between(match["black_chess"], start_dt, end_dt)
+
+        unique = []
+        seen = set()
+        for game in games:
+            gid = game.get("uuid") or game.get("url")
+            if gid in seen:
+                continue
+            seen.add(gid)
+            unique.append(game)
+
+        final_reason = "sin partidas de los jugadores en el rango"
+
+        for game in unique:
+            if match.get("rejected_game_uuid") and game.get("uuid") == match.get("rejected_game_uuid"):
+                final_reason = "partida invertida rechazada previamente"
+                continue
+
+            exact, inverted = game_is_between_players_any_color(game, match["white_user_id"], match["black_user_id"])
+            if not exact and not inverted:
+                final_reason = "usuarios no coinciden"
+                continue
+
+            ok, reason = validate_game_without_color(game, tournament, start_dt, end_dt)
+            if not ok:
+                final_reason = reason
+                continue
+
+            score = score_for_fixture_white(game, match["white_user_id"], match["black_user_id"])
+            if score is None:
+                final_reason = "partida encontrada sin resultado interpretable"
+                continue
+
+            result = result_label(score)
+
+            if exact:
+                exec_sql("""
+                    UPDATE matches
+                    SET status='finished', result=?, result_type='normal',
+                        chesscom_url=?, game_uuid=?, locked=1, detected_at=?
+                    WHERE id=?
+                """, (result, game.get("url"), game.get("uuid"), dt.datetime.now(), match["id"]))
+                apply_elo(match["id"], match["white_user_id"], match["black_user_id"], score)
+                found += 1
+                final_reason = "detectada"
+                break
+
+            if inverted:
+                if mark_color_review(match, game):
+                    final_reason = "se jugó con colores invertidos: requiere aceptar o rechazar"
+                    break
+
+        debug.append({"Cruce": f"{match['white_chess']} vs {match['black_chess']}", "Estado": final_reason})
+
+    return found, debug
+
+
+# =========================================================
+# TOURNAMENT ACTIONS
+# =========================================================
+
+def register_player(tournament_id, user_id):
+    try:
+        insert_returning("registrations", ["tournament_id", "user_id", "status", "wo_count"], [tournament_id, user_id, "active", 0])
+    except Exception:
+        pass
+
+
+def import_fixture_csv(df, created_by, rules, time_class, time_control, rated_filter, strict_colors):
+    required = {"torneo", "ronda", "fecha_inicio", "fecha_fin", "blancas_chesscom", "negras_chesscom"}
+    missing = required - set(df.columns)
+    if missing:
+        raise Exception(f"Faltan columnas: {', '.join(sorted(missing))}")
+
+    created_matches = 0
+    created_players = 0
+
+    for tournament_name, group in df.groupby("torneo"):
+        tournament_name = str(tournament_name).strip()
+        if not tournament_name:
+            continue
+
+        tournament_id = insert_returning(
+            "tournaments",
+            ["name", "description", "status", "tournament_type", "rules", "time_class", "time_control", "rated_filter", "strict_colors", "created_by"],
+            [tournament_name, "Fixture importado para detección automática", "playing", "fixture_importado", rules, time_class, str(time_control), rated_filter, 1 if strict_colors else 0, created_by],
+        )
+
+        for round_number, round_df in group.groupby("ronda"):
+            round_number = int(round_number)
+            start_value = parse_date_series(round_df["fecha_inicio"]).min()
+            end_value = parse_date_series(round_df["fecha_fin"]).max()
+            if pd.isna(start_value) or pd.isna(end_value):
+                continue
+
+            round_id = insert_returning(
+                "rounds",
+                ["tournament_id", "number", "start_datetime", "end_datetime", "status"],
+                [tournament_id, round_number, start_value.to_pydatetime(), end_value.to_pydatetime(), "active"],
+            )
+
+            for _, row in round_df.iterrows():
+                white_raw = norm(row["blancas_chesscom"])
+                black_raw = norm(row["negras_chesscom"])
+                if not valid_chess_username(white_raw) or not valid_chess_username(black_raw):
+                    continue
+
+                white_id, wc = get_or_create_player(white_raw)
+                black_id, bc = get_or_create_player(black_raw)
+                created_players += int(wc) + int(bc)
+
+                register_player(tournament_id, white_id)
+                register_player(tournament_id, black_id)
+
+                insert_returning(
+                    "matches",
+                    ["tournament_id", "round_id", "white_user_id", "black_user_id", "status", "locked"],
+                    [tournament_id, round_id, white_id, black_id, "pending", 0],
+                )
+                created_matches += 1
+
+    audit(created_by, "import_fixture", f"matches={created_matches}, players={created_players}")
+    return created_matches, created_players
+
+
+def import_rounds_to_existing_tournament(df, tournament_id):
+    required = {"ronda", "fecha_inicio", "fecha_fin", "blancas_chesscom", "negras_chesscom"}
+    missing = required - set(df.columns)
+    if missing:
+        raise Exception(f"Faltan columnas: {', '.join(sorted(missing))}")
+
+    created_matches = 0
+    created_players = 0
+
+    for round_number, round_df in df.groupby("ronda"):
+        round_number = int(round_number)
+        start_value = parse_date_series(round_df["fecha_inicio"]).min()
+        end_value = parse_date_series(round_df["fecha_fin"]).max()
+        if pd.isna(start_value) or pd.isna(end_value):
+            continue
+
+        existing_round = q("SELECT id FROM rounds WHERE tournament_id=? AND number=?", (tournament_id, round_number), one=True)
+        if existing_round:
+            round_id = existing_round["id"]
+            exec_sql("UPDATE rounds SET start_datetime=?, end_datetime=? WHERE id=?", (start_value.to_pydatetime(), end_value.to_pydatetime(), round_id))
+        else:
+            round_id = insert_returning(
+                "rounds",
+                ["tournament_id", "number", "start_datetime", "end_datetime", "status"],
+                [tournament_id, round_number, start_value.to_pydatetime(), end_value.to_pydatetime(), "active"],
+            )
+
+        for _, row in round_df.iterrows():
+            white_raw = norm(row["blancas_chesscom"])
+            black_raw = norm(row["negras_chesscom"])
+            if not valid_chess_username(white_raw) or not valid_chess_username(black_raw):
+                continue
+
+            white_id, wc = get_or_create_player(white_raw)
+            black_id, bc = get_or_create_player(black_raw)
+            created_players += int(wc) + int(bc)
+
+            register_player(tournament_id, white_id)
+            register_player(tournament_id, black_id)
+
+            exists = q("""
+                SELECT id FROM matches
+                WHERE tournament_id=? AND round_id=? AND white_user_id=? AND black_user_id=?
+            """, (tournament_id, round_id, white_id, black_id), one=True)
+            if exists:
+                continue
+
+            insert_returning(
+                "matches",
+                ["tournament_id", "round_id", "white_user_id", "black_user_id", "status", "locked"],
+                [tournament_id, round_id, white_id, black_id, "pending", 0],
+            )
+            created_matches += 1
+
+    exec_sql("UPDATE tournaments SET status='playing' WHERE id=?", (tournament_id,))
+    return created_matches, created_players
+
+
+def create_empty_tournament(name, description, rules, time_class, time_control, rated_filter, strict_colors, created_by):
+    return insert_returning(
+        "tournaments",
+        ["name", "description", "status", "tournament_type", "rules", "time_class", "time_control", "rated_filter", "strict_colors", "created_by"],
+        [name, description, "open", "manual", rules, time_class, str(time_control), rated_filter, 1 if strict_colors else 0, created_by],
+    )
 
 
 def accept_color_review(match_id, admin_user_id):
     match = q("SELECT * FROM matches WHERE id=?", (match_id,), one=True)
     if not match:
         raise ValueError("Partida no encontrada.")
-    if match["status"] != "review" or match["result_type"] != "color_review":
-        raise ValueError("Esta partida no está pendiente de revisión por colores invertidos.")
+    if match["status"] != "review":
+        raise ValueError("La partida no está en revisión.")
 
     result = match["review_result"] or match["result"]
     score = score_from_result_label(result)
     if score is None:
-        raise ValueError("Resultado de revisión inválido.")
+        raise ValueError("Resultado inválido.")
 
     exec_sql("""
         UPDATE matches
-        SET status='finished', result=?, result_type='color_inverted_accepted',
-            locked=1, detected_at=?
+        SET status='finished', result=?, result_type='color_inverted_accepted', locked=1, detected_at=?
         WHERE id=?
-    """, (result, dt.datetime.now().isoformat(timespec="seconds"), match_id))
-
+    """, (result, dt.datetime.now(), match_id))
     apply_elo(match_id, match["white_user_id"], match["black_user_id"], score)
     audit(admin_user_id, "accept_color_review", f"match={match_id}, result={result}")
 
@@ -985,112 +1036,40 @@ def reject_color_review(match_id, admin_user_id):
             chesscom_url=NULL, game_uuid=NULL, locked=0
         WHERE id=?
     """, (match_id,))
-
     audit(admin_user_id, "reject_color_review", f"match={match_id}")
 
 
+def set_manual_result(match_id, result, admin_user_id):
+    match = q("SELECT * FROM matches WHERE id=?", (match_id,), one=True)
+    if not match:
+        raise ValueError("Partida no encontrada.")
 
-def scan_tournament(tournament_id):
-    tournament = q("SELECT * FROM tournaments WHERE id=?", (tournament_id,), one=True)
-    if not tournament:
-        return 0, [{"Cruce": "-", "Estado": "torneo no encontrado"}]
+    old_status = match["status"]
+    score = score_from_result_label(result)
+    if score is None:
+        raise ValueError("Resultado inválido.")
 
-    pending_matches = q("""
-        SELECT m.*, r.number, r.start_datetime, r.end_datetime,
-               wu.chesscom_user white_chess,
-               bu.chesscom_user black_chess
-        FROM matches m
-        JOIN rounds r ON r.id=m.round_id
-        JOIN users wu ON wu.id=m.white_user_id
-        JOIN users bu ON bu.id=m.black_user_id
-        WHERE m.tournament_id=? AND m.status='pending' AND m.locked=0
-    """, (tournament_id,))
+    exec_sql("""
+        UPDATE matches
+        SET status='finished', result=?, result_type='manual', locked=1, detected_at=?
+        WHERE id=?
+    """, (result, dt.datetime.now(), match_id))
 
-    found = 0
-    debug = []
+    if old_status != "finished":
+        apply_elo(match_id, match["white_user_id"], match["black_user_id"], score)
 
-    for match in pending_matches:
-        start_dt = dt.datetime.fromisoformat(match["start_datetime"])
-        end_dt = dt.datetime.fromisoformat(match["end_datetime"])
+    audit(admin_user_id, "manual_result", f"match={match_id}, result={result}")
 
-        white_exists = chess_user_exists(match["white_chess"])
-        black_exists = chess_user_exists(match["black_chess"])
 
-        if not white_exists or not black_exists:
-            missing = []
-            if not white_exists:
-                missing.append(match["white_chess"])
-            if not black_exists:
-                missing.append(match["black_chess"])
-            debug.append({
-                "Cruce": f"{match['white_chess']} vs {match['black_chess']}",
-                "Estado": "usuario inexistente en Chess.com: " + ", ".join(missing)
-            })
-            continue
+def clear_match_result(match_id, admin_user_id):
+    exec_sql("""
+        UPDATE matches
+        SET status='pending', result=NULL, result_type='normal', chesscom_url=NULL, game_uuid=NULL,
+            locked=0, detected_at=NULL
+        WHERE id=?
+    """, (match_id,))
+    audit(admin_user_id, "clear_result", f"match={match_id}")
 
-        games = chess_games_between(match["white_chess"], start_dt, end_dt)
-        # También buscar por el jugador negro por si Chess.com no devuelve bien desde el blanco
-        games += chess_games_between(match["black_chess"], start_dt, end_dt)
-
-        seen = set()
-        unique_games = []
-        for game in games:
-            gid = game.get("uuid") or game.get("url")
-            if gid in seen:
-                continue
-            seen.add(gid)
-            unique_games.append(game)
-
-        final_reason = "sin partidas de los jugadores en el rango"
-
-        for game in unique_games:
-            if match["rejected_game_uuid"] and game.get("uuid") == match["rejected_game_uuid"]:
-                final_reason = "partida invertida rechazada previamente"
-                continue
-
-            exact, inverted = game_is_between_players_any_color(game, match["white_user_id"], match["black_user_id"])
-            if not exact and not inverted:
-                final_reason = "usuarios no coinciden"
-                continue
-
-            ok_details, detail_reason = validate_game_without_color(game, tournament, start_dt, end_dt)
-            if not ok_details:
-                final_reason = detail_reason
-                continue
-
-            score = score_for_fixture_white(game, match["white_user_id"], match["black_user_id"])
-            if score is None:
-                final_reason = "partida encontrada sin resultado interpretable"
-                continue
-
-            result = result_label(score)
-
-            if exact:
-                exec_sql("""
-                    UPDATE matches
-                    SET status='finished', result=?, result_type='normal',
-                        chesscom_url=?, game_uuid=?, locked=1, detected_at=?
-                    WHERE id=?
-                """, (
-                    result,
-                    game.get("url"),
-                    game.get("uuid"),
-                    dt.datetime.now().isoformat(timespec="seconds"),
-                    match["id"],
-                ))
-                apply_elo(match["id"], match["white_user_id"], match["black_user_id"], score)
-                found += 1
-                final_reason = "detectada"
-                break
-
-            if inverted:
-                if mark_color_review(match, game):
-                    final_reason = "se jugó con colores invertidos: requiere aceptar o rechazar"
-                    break
-
-        debug.append({"Cruce": f"{match['white_chess']} vs {match['black_chess']}", "Estado": final_reason})
-
-    return found, debug
 
 def apply_wo_expired(tournament_id):
     now = dt.datetime.now()
@@ -1103,7 +1082,7 @@ def apply_wo_expired(tournament_id):
 
     applied = 0
     for match in matches:
-        end_dt = dt.datetime.fromisoformat(match["end_datetime"])
+        end_dt = parse_db_datetime(match["end_datetime"])
         if now <= end_dt:
             continue
 
@@ -1111,78 +1090,75 @@ def apply_wo_expired(tournament_id):
             UPDATE matches
             SET status='finished', result='0-0 WO', result_type='wo', locked=1, detected_at=?
             WHERE id=?
-        """, (now.isoformat(timespec="seconds"), match["id"]))
+        """, (now, match["id"]))
 
-        for user_id in [match["white_user_id"], match["black_user_id"]]:
-            exec_sql("""
-                UPDATE registrations
-                SET wo_count=IFNULL(wo_count,0)+1
-                WHERE tournament_id=? AND user_id=?
-            """, (tournament_id, user_id))
-
-            reg = q("SELECT wo_count FROM registrations WHERE tournament_id=? AND user_id=?", (tournament_id, user_id), one=True)
+        for uid in [match["white_user_id"], match["black_user_id"]]:
+            exec_sql("UPDATE registrations SET wo_count=COALESCE(wo_count,0)+1 WHERE tournament_id=? AND user_id=?", (tournament_id, uid))
+            reg = q("SELECT wo_count FROM registrations WHERE tournament_id=? AND user_id=?", (tournament_id, uid), one=True)
             if reg and reg["wo_count"] >= 2:
-                exec_sql("""
-                    UPDATE registrations
-                    SET status='disqualified'
-                    WHERE tournament_id=? AND user_id=?
-                """, (tournament_id, user_id))
+                exec_sql("UPDATE registrations SET status='disqualified' WHERE tournament_id=? AND user_id=?", (tournament_id, uid))
 
         applied += 1
 
     return applied
 
 
+# =========================================================
+# STANDINGS
+# =========================================================
 
-def score_from_result_label(result):
-    if result == "1-0":
-        return 1.0
-    if result == "0-1":
-        return 0.0
-    if result == "1/2-1/2":
-        return 0.5
-    return None
+def standings(tournament_id):
+    regs = q("""
+        SELECT u.id, u.display_name, u.chesscom_user, u.elo, r.status, r.wo_count
+        FROM registrations r
+        JOIN users u ON u.id=r.user_id
+        WHERE r.tournament_id=? AND r.status!='removed'
+    """, (tournament_id,))
 
+    table = []
+    for user in regs:
+        matches = q("""
+            SELECT * FROM matches
+            WHERE tournament_id=? AND status='finished'
+            AND (white_user_id=? OR black_user_id=?)
+        """, (tournament_id, user["id"], user["id"]))
 
-def set_manual_result(match_id, result, admin_user_id, apply_elo_if_pending=True):
-    match = q("SELECT * FROM matches WHERE id=?", (match_id,), one=True)
-    if not match:
-        raise ValueError("Partida no encontrada.")
+        pts = wins = draws = losses = wo = 0
+        for match in matches:
+            if match["result_type"] == "wo":
+                wo += 1
+                continue
 
-    old_status = match["status"]
-    old_result = match["result"]
-    score = score_from_result_label(result)
-    if score is None:
-        raise ValueError("Resultado inválido.")
+            if match["white_user_id"] == user["id"]:
+                if match["result"] == "1-0":
+                    pts += 1; wins += 1
+                elif match["result"] == "0-1":
+                    losses += 1
+                elif match["result"] == "1/2-1/2":
+                    pts += 0.5; draws += 1
+            else:
+                if match["result"] == "0-1":
+                    pts += 1; wins += 1
+                elif match["result"] == "1-0":
+                    losses += 1
+                elif match["result"] == "1/2-1/2":
+                    pts += 0.5; draws += 1
 
-    exec_sql("""
-        UPDATE matches
-        SET status='finished', result=?, result_type='manual', locked=1, detected_at=?
-        WHERE id=?
-    """, (result, dt.datetime.now().isoformat(timespec="seconds"), match_id))
+        table.append({
+            "Jugador": user["display_name"],
+            "Chess.com": user["chesscom_user"],
+            "ELO": user["elo"],
+            "PJ": len(matches),
+            "G": wins,
+            "E": draws,
+            "P": losses,
+            "WO": user["wo_count"],
+            "Estado": user["status"],
+            "Puntos": pts,
+        })
 
-    if old_status != "finished" and apply_elo_if_pending:
-        apply_elo(match_id, match["white_user_id"], match["black_user_id"], score)
-
-    audit(admin_user_id, "manual_result", f"match={match_id}, old={old_result}, new={result}")
-
-
-def clear_match_result(match_id, admin_user_id):
-    match = q("SELECT * FROM matches WHERE id=?", (match_id,), one=True)
-    if not match:
-        raise ValueError("Partida no encontrada.")
-
-    exec_sql("""
-        UPDATE matches
-        SET status='pending', result=NULL, result_type='normal', chesscom_url=NULL, game_uuid=NULL, locked=0, detected_at=NULL
-        WHERE id=?
-    """, (match_id,))
-
-    audit(admin_user_id, "clear_result", f"match={match_id}")
-
-
-def auto_scan_enabled_key(tournament_id):
-    return f"auto_scan_tournament_{tournament_id}"
+    table.sort(key=lambda x: (x["Estado"] != "disqualified", x["Puntos"], x["ELO"], x["G"]), reverse=True)
+    return table
 
 
 # =========================================================
@@ -1196,54 +1172,58 @@ if "user" not in st.session_state:
 
 st.markdown("""
 <style>
-.block-container {max-width: 1180px;}
+.block-container {max-width: 1200px;}
 .login-box {max-width: 440px; margin: 0 auto;}
 .login-box [data-testid="stTextInput"] {max-width: 440px;}
 .login-box .stButton button {width: 180px;}
-.small-input [data-testid="stTextInput"] {max-width: 260px;}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("♟️ Torneos de Ajedrez — V7.4")
+st.title("♟️ Torneos de Ajedrez — V8 Supabase")
+
+if use_postgres():
+    st.sidebar.success("DB: Supabase/PostgreSQL")
+else:
+    st.sidebar.warning("DB: SQLite local fallback")
 
 if not st.session_state.user:
     st.markdown('<div class="login-box">', unsafe_allow_html=True)
-    login_tab, register_tab = st.tabs(["Ingresar", "Crear cuenta"])
+    tab_login, tab_reg = st.tabs(["Ingresar", "Crear/Reclamar cuenta"])
 
-    with login_tab:
-        st.caption("Si el admin ya cargó tu perfil, entrá con tu usuario de Chess.com y contraseña 12345.")
+    with tab_login:
+        st.caption("Si el admin ya creó tu perfil, ingresá con tu usuario de Chess.com y contraseña 12345.")
         username = st.text_input("Usuario Chess.com", key="login_username")
         password = st.text_input("Contraseña", type="password", key="login_password")
         if st.button("Ingresar"):
-            logged_user, error = login(username, password)
-            if logged_user:
-                st.session_state.user = logged_user
+            user, error = login(username, password)
+            if user:
+                st.session_state.user = user
                 st.rerun()
             else:
                 st.error(error)
 
-    with register_tab:
-        chess_user = st.text_input("Usuario Chess.com", key="reg_chess")
-        display_name = st.text_input("Nombre visible", key="reg_name")
-        new_password = st.text_input("Contraseña", type="password", key="reg_password")
+    with tab_reg:
+        chess = st.text_input("Usuario Chess.com", key="reg_chess")
+        display = st.text_input("Nombre visible", key="reg_display")
+        password = st.text_input("Contraseña", type="password", key="reg_password")
         if st.button("Crear/Reclamar cuenta"):
-            if not chess_user or not new_password:
-                st.warning("Completá usuario Chess.com y contraseña.")
-            else:
-                try:
-                    create_or_claim_user(chess_user, new_password, chess_user, display_name or chess_user)
-                    st.success("Cuenta creada o reclamada. Ahora ingresá.")
-                except Exception as exc:
-                    st.error(exc)
+            try:
+                if not chess or not password:
+                    st.warning("Completá usuario Chess.com y contraseña.")
+                else:
+                    create_or_claim_user(chess, password, chess, display or chess)
+                    st.success("Cuenta creada/reclamada. Ahora ingresá.")
+            except Exception as exc:
+                st.error(exc)
 
     st.markdown("</div>", unsafe_allow_html=True)
     st.stop()
 
 current_user = get_user(st.session_state.user["id"])
-
 st.sidebar.success(f"{current_user['display_name']} | {current_user['role']} | ELO {current_user['elo']}")
 if current_user.get("avatar_url"):
     st.sidebar.image(current_user["avatar_url"], width=100)
+
 if st.sidebar.button("Cerrar sesión"):
     st.session_state.user = None
     st.rerun()
@@ -1254,7 +1234,7 @@ if current_user["must_change_password"]:
     p2 = st.text_input("Repetir nueva contraseña", type="password")
     if st.button("Cambiar contraseña"):
         if p1 and p1 == p2:
-            update_password(current_user["id"], p1, must_change=0)
+            update_password(current_user["id"], p1, 0)
             st.success("Contraseña actualizada.")
             st.rerun()
         else:
@@ -1267,130 +1247,98 @@ if is_staff(current_user):
 
 choice = st.sidebar.radio("Menú", menu)
 
-
 if choice == "Crear torneo":
     st.header("Crear torneo vacío/manual")
-    st.write("Creá un torneo primero y después cargale rondas desde CSV en el menú **Importar rondas**.")
-
     name = st.text_input("Nombre del torneo")
-    description = st.text_area("Descripción")
+    desc = st.text_area("Descripción")
 
-    c1, c2, c3 = st.columns(3)
-    rules = "chess" if c1.selectbox("Modalidad", ["Ajedrez normal", "Chess960"], key="ct_rules") == "Ajedrez normal" else "chess960"
-    time_class = c2.selectbox("Clase", ["blitz", "rapid", "bullet", "daily"], key="ct_class")
-    time_control = c3.text_input("Ritmo exacto", value="600", key="ct_time")
-
-    rated_filter = {"Cualquiera": "any", "Solo rated": "rated", "Solo casual": "casual"}[
-        st.selectbox("Rated/Casual", ["Cualquiera", "Solo rated", "Solo casual"], key="ct_rated")
-    ]
-    strict_colors = st.checkbox("Respetar colores exactos", value=True, key="ct_strict")
-
-    if st.button("Crear torneo"):
-        if not name.strip():
-            st.warning("Poné un nombre.")
-        else:
-            tid = create_empty_tournament(
-                name.strip(),
-                description,
-                rules,
-                time_class,
-                time_control,
-                rated_filter,
-                strict_colors,
-                current_user["id"],
-            )
-            st.success(f"Torneo creado. ID: {tid}. Ahora podés ir a Importar rondas.")
-
-if choice == "Importar rondas":
-    st.header("Importar rondas a un torneo existente")
-    tournaments = q("SELECT id,name,time_class,time_control FROM tournaments ORDER BY id DESC")
-
-    if not tournaments:
-        st.info("Primero creá un torneo en el menú Crear torneo.")
-    else:
-        labels = {f"{t['name']} — {t['time_class']} — {t['time_control']}": t["id"] for t in tournaments}
-        selected = st.selectbox("Torneo destino", list(labels.keys()))
-        tournament_id = labels[selected]
-
-        st.write("Columnas requeridas: `ronda`, `fecha_inicio`, `fecha_fin`, `blancas_chesscom`, `negras_chesscom`.")
-
-        template = pd.DataFrame([{
-            "ronda": 1,
-            "fecha_inicio": "2026-02-27 00:00",
-            "fecha_fin": "2026-04-03 23:59",
-            "blancas_chesscom": "matiasbulacio",
-            "negras_chesscom": "juan123",
-        }])
-        st.download_button(
-            "Descargar plantilla de rondas",
-            template.to_csv(index=False).encode("utf-8"),
-            "rondas_fixture.csv",
-            "text/csv",
-        )
-
-        uploaded = st.file_uploader("Subir CSV de rondas", type=["csv"], key="rounds_csv")
-        if uploaded:
-            try:
-                df = read_uploaded_csv(uploaded)
-                st.dataframe(df, use_container_width=True)
-
-                if st.button("Importar rondas"):
-                    matches, players = import_rounds_to_existing_tournament(df, tournament_id)
-                    st.success(f"Rondas importadas. Cruces creados: {matches}. Jugadores nuevos: {players}.")
-            except Exception as exc:
-                st.error(exc)
-
-elif choice == "Importar fixture":
-    st.header("Importar fixture pendiente")
-    st.write("Columnas requeridas: `torneo`, `ronda`, `fecha_inicio`, `fecha_fin`, `blancas_chesscom`, `negras_chesscom`.")
-
-    template = pd.DataFrame([{
-        "torneo": "TORNEO N°11",
-        "ronda": 1,
-        "fecha_inicio": "2026-02-27 00:00",
-        "fecha_fin": "2026-04-03 23:59",
-        "blancas_chesscom": "matiasbulacio",
-        "negras_chesscom": "juan123",
-    }])
-    st.download_button("Descargar plantilla CSV", template.to_csv(index=False).encode("utf-8"), "fixture_pendiente.csv", "text/csv")
-
-    st.subheader("Reglas de detección")
     c1, c2, c3 = st.columns(3)
     rules = "chess" if c1.selectbox("Modalidad", ["Ajedrez normal", "Chess960"]) == "Ajedrez normal" else "chess960"
-    time_class = c2.selectbox("Clase", ["blitz", "rapid", "bullet", "daily"])
-    time_control = c3.text_input("Ritmo exacto", value="600", help="600=10+0, 300=5+0, 180+2=3+2")
+    time_class = c2.selectbox("Clase", ["rapid", "blitz", "bullet", "daily"])
+    time_control = c3.text_input("Ritmo exacto", value="600")
 
     rated_filter = {"Cualquiera": "any", "Solo rated": "rated", "Solo casual": "casual"}[
         st.selectbox("Rated/Casual", ["Cualquiera", "Solo rated", "Solo casual"])
     ]
     strict_colors = st.checkbox("Respetar colores exactos", value=True)
 
-    uploaded = st.file_uploader("Subir CSV", type=["csv"])
+    if st.button("Crear torneo"):
+        if not name.strip():
+            st.warning("Poné un nombre.")
+        else:
+            tid = create_empty_tournament(name.strip(), desc, rules, time_class, time_control, rated_filter, strict_colors, current_user["id"])
+            st.success(f"Torneo creado. ID: {tid}")
+
+elif choice == "Importar fixture":
+    st.header("Importar fixture completo")
+    st.write("Columnas: `torneo`, `ronda`, `fecha_inicio`, `fecha_fin`, `blancas_chesscom`, `negras_chesscom`.")
+
+    template = pd.DataFrame([{
+        "torneo": "TORNEO N°11",
+        "ronda": 1,
+        "fecha_inicio": "27/02/2026 00:00",
+        "fecha_fin": "03/04/2026 23:59",
+        "blancas_chesscom": "pabloroldan",
+        "negras_chesscom": "matiasbulacio",
+    }])
+    st.download_button("Descargar plantilla", template.to_csv(index=False).encode("utf-8"), "fixture.csv", "text/csv")
+
+    c1, c2, c3 = st.columns(3)
+    rules = "chess" if c1.selectbox("Modalidad", ["Ajedrez normal", "Chess960"], key="if_rules") == "Ajedrez normal" else "chess960"
+    time_class = c2.selectbox("Clase", ["rapid", "blitz", "bullet", "daily"], key="if_class")
+    time_control = c3.text_input("Ritmo exacto", value="600", key="if_time")
+
+    rated_filter = {"Cualquiera": "any", "Solo rated": "rated", "Solo casual": "casual"}[
+        st.selectbox("Rated/Casual", ["Cualquiera", "Solo rated", "Solo casual"], key="if_rated")
+    ]
+    strict_colors = st.checkbox("Respetar colores exactos", value=True, key="if_strict")
+
+    uploaded = st.file_uploader("Subir CSV", type=["csv"], key="fixture_csv")
     if uploaded:
         try:
             df = read_uploaded_csv(uploaded)
             st.dataframe(df, use_container_width=True)
-
             if st.button("Importar fixture"):
-                matches, players = import_fixture_csv(
-                    df,
-                    current_user["id"],
-                    rules,
-                    time_class,
-                    time_control,
-                    rated_filter,
-                    strict_colors,
-                )
-                st.success(f"Importado. Cruces creados: {matches}. Jugadores nuevos: {players}.")
+                matches, players = import_fixture_csv(df, current_user["id"], rules, time_class, time_control, rated_filter, strict_colors)
+                st.success(f"Fixture importado. Cruces: {matches}. Jugadores nuevos: {players}.")
         except Exception as exc:
             st.error(exc)
+
+elif choice == "Importar rondas":
+    st.header("Importar rondas a torneo existente")
+    tournaments = q("SELECT id,name,time_class,time_control FROM tournaments ORDER BY id DESC")
+    if not tournaments:
+        st.info("Primero creá o importá un torneo.")
+    else:
+        labels = {f"{t['name']} — {t['time_class']} — {t['time_control']}": t["id"] for t in tournaments}
+        selected = st.selectbox("Torneo", list(labels.keys()))
+        tid = labels[selected]
+
+        template = pd.DataFrame([{
+            "ronda": 1,
+            "fecha_inicio": "27/02/2026 00:00",
+            "fecha_fin": "03/04/2026 23:59",
+            "blancas_chesscom": "pabloroldan",
+            "negras_chesscom": "matiasbulacio",
+        }])
+        st.download_button("Descargar plantilla rondas", template.to_csv(index=False).encode("utf-8"), "rondas.csv", "text/csv")
+
+        uploaded = st.file_uploader("Subir CSV de rondas", type=["csv"], key="rounds_csv")
+        if uploaded:
+            try:
+                df = read_uploaded_csv(uploaded)
+                st.dataframe(df, use_container_width=True)
+                if st.button("Importar rondas"):
+                    matches, players = import_rounds_to_existing_tournament(df, tid)
+                    st.success(f"Rondas importadas. Cruces: {matches}. Jugadores nuevos: {players}.")
+            except Exception as exc:
+                st.error(exc)
 
 elif choice == "Torneos":
     st.header("Torneos")
     tournaments = q("SELECT * FROM tournaments ORDER BY id DESC")
-
     if not tournaments:
-        st.info("Todavía no hay torneos cargados.")
+        st.info("Todavía no hay torneos.")
 
     for t in tournaments:
         with st.expander(f"{t['name']} — {t['status']} — {t['time_class']} — {t['time_control']}", expanded=True):
@@ -1404,37 +1352,42 @@ elif choice == "Torneos":
                 with st.expander("Modificar torneo"):
                     ec1, ec2, ec3 = st.columns(3)
                     new_time = ec1.text_input("Ritmo regular", value=str(t["time_control"]), key=f"time_{t['id']}")
-                    new_class = ec2.selectbox(
-                        "Clase regular",
-                        ["blitz", "rapid", "bullet", "daily"],
-                        index=["blitz", "rapid", "bullet", "daily"].index(t["time_class"]) if t["time_class"] in ["blitz", "rapid", "bullet", "daily"] else 0,
-                        key=f"class_{t['id']}",
-                    )
-                    new_strict = ec3.checkbox("Colores exactos", value=bool(t["strict_colors"]), key=f"strict_{t['id']}")
+                    new_class = ec2.selectbox("Clase regular", ["rapid", "blitz", "bullet", "daily"], index=["rapid", "blitz", "bullet", "daily"].index(t["time_class"]) if t["time_class"] in ["rapid", "blitz", "bullet", "daily"] else 0, key=f"class_{t['id']}")
+                    strict = ec3.checkbox("Colores exactos", value=bool(t["strict_colors"]), key=f"strict_{t['id']}")
 
-                    st.markdown("**Playoffs**")
                     pc1, pc2 = st.columns(2)
                     playoff_time = pc1.text_input("Ritmo playoffs", value=str(t["playoff_time_control"]), key=f"ptime_{t['id']}")
-                    playoff_class = pc2.selectbox(
-                        "Clase playoffs",
-                        ["blitz", "rapid", "bullet", "daily"],
-                        index=["blitz", "rapid", "bullet", "daily"].index(t["playoff_time_class"]) if t["playoff_time_class"] in ["blitz", "rapid", "bullet", "daily"] else 0,
-                        key=f"pclass_{t['id']}",
-                    )
+                    playoff_class = pc2.selectbox("Clase playoffs", ["rapid", "blitz", "bullet", "daily"], index=["rapid", "blitz", "bullet", "daily"].index(t["playoff_time_class"]) if t["playoff_time_class"] in ["rapid", "blitz", "bullet", "daily"] else 1, key=f"pclass_{t['id']}")
 
-                    if st.button("Guardar configuración", key=f"save_config_{t['id']}"):
+                    if st.button("Guardar configuración", key=f"save_t_{t['id']}"):
                         exec_sql("""
                             UPDATE tournaments
                             SET time_control=?, time_class=?, strict_colors=?, playoff_time_control=?, playoff_time_class=?
                             WHERE id=?
-                        """, (new_time, new_class, 1 if new_strict else 0, playoff_time, playoff_class, t["id"]))
-                        st.success("Configuración actualizada.")
+                        """, (new_time, new_class, 1 if strict else 0, playoff_time, playoff_class, t["id"]))
+                        st.success("Configuración guardada.")
                         st.rerun()
+
+                with st.expander("Editar fechas de rondas"):
+                    rounds = q("SELECT * FROM rounds WHERE tournament_id=? ORDER BY number", (t["id"],))
+                    for r in rounds:
+                        st.write(f"**Ronda {r['number']}**")
+                        start_dt = parse_db_datetime(r["start_datetime"])
+                        end_dt = parse_db_datetime(r["end_datetime"])
+                        cfi, cff = st.columns(2)
+                        new_start = cfi.text_input("Inicio", value=start_dt.strftime("%d/%m/%Y %H:%M"), key=f"rs_{r['id']}")
+                        new_end = cff.text_input("Fin", value=end_dt.strftime("%d/%m/%Y %H:%M"), key=f"re_{r['id']}")
+                        if st.button("Guardar fechas", key=f"save_round_{r['id']}"):
+                            parsed_start = pd.to_datetime(new_start, dayfirst=True).to_pydatetime()
+                            parsed_end = pd.to_datetime(new_end, dayfirst=True).to_pydatetime()
+                            exec_sql("UPDATE rounds SET start_datetime=?, end_datetime=? WHERE id=?", (parsed_start, parsed_end, r["id"]))
+                            st.success("Fechas actualizadas.")
+                            st.rerun()
 
                 b1, b2 = st.columns(2)
                 if b1.button("Buscar resultados Chess.com", key=f"scan_{t['id']}"):
                     found, debug = scan_tournament(t["id"])
-                    st.success(f"Resultados detectados: {found}")
+                    st.success(f"Detectadas: {found}")
                     st.dataframe(debug, use_container_width=True)
 
                 if b2.button("Aplicar WO vencidos", key=f"wo_{t['id']}"):
@@ -1442,28 +1395,19 @@ elif choice == "Torneos":
                     st.warning(f"WO aplicados: {applied}")
                     st.rerun()
 
-
-            if is_staff(current_user):
+                # Auto scan simple: refresh vía meta cada minuto si se activa
                 with st.expander("Motor automático y resultados manuales"):
-                    auto_key = auto_scan_enabled_key(t["id"])
-                    auto_enabled = st.checkbox(
-                        "Detectar partidas automáticamente cada 1 minuto",
-                        value=st.session_state.get(auto_key, False),
-                        key=auto_key,
-                    )
+                    auto = st.checkbox("Detectar automáticamente cada 1 minuto", key=f"auto_{t['id']}")
+                    if auto:
+                        st.markdown('<meta http-equiv="refresh" content="60">', unsafe_allow_html=True)
+                        found, debug = scan_tournament(t["id"])
+                        st.caption(f"Auto-búsqueda ejecutada. Detectadas: {found}")
+                        st.dataframe(debug, use_container_width=True)
 
-                    if auto_enabled:
-                        st_autorefresh(interval=60 * 1000, key=f"refresh_scan_{t['id']}")
-                        found_auto, debug_auto = scan_tournament(t["id"])
-                        st.caption(f"Auto-búsqueda ejecutada. Detectadas: {found_auto}")
-                        if debug_auto:
-                            st.dataframe(debug_auto, use_container_width=True)
-
-                    st.markdown("**Cargar o modificar resultado manualmente**")
-                    manual_matches = q("""
+                    all_matches = q("""
                         SELECT m.*, r.number,
-                               wu.chesscom_user white_chess,
-                               bu.chesscom_user black_chess
+                               wu.chesscom_user AS white_chess,
+                               bu.chesscom_user AS black_chess
                         FROM matches m
                         JOIN rounds r ON r.id=m.round_id
                         JOIN users wu ON wu.id=m.white_user_id
@@ -1471,84 +1415,69 @@ elif choice == "Torneos":
                         WHERE m.tournament_id=?
                         ORDER BY r.number, m.id
                     """, (t["id"],))
-
-                    if manual_matches:
-                        labels = {
-                            f"R{m['number']} | {m['white_chess']} vs {m['black_chess']} | {m['status']} | {m['result'] or 'sin resultado'}": m["id"]
-                            for m in manual_matches
-                        }
-                        selected_match = st.selectbox("Partida", list(labels.keys()), key=f"manual_match_{t['id']}")
-                        result = st.selectbox("Resultado", ["1-0", "0-1", "1/2-1/2"], key=f"manual_result_{t['id']}")
-
-                        cman1, cman2 = st.columns(2)
-                        if cman1.button("Guardar resultado manual", key=f"save_manual_result_{t['id']}"):
+                    if all_matches:
+                        labels = {f"R{m['number']} | {m['white_chess']} vs {m['black_chess']} | {m['status']} | {m['result'] or 'sin resultado'}": m["id"] for m in all_matches}
+                        sel = st.selectbox("Partida", list(labels.keys()), key=f"manual_match_{t['id']}")
+                        res = st.selectbox("Resultado", ["1-0", "0-1", "1/2-1/2"], key=f"manual_res_{t['id']}")
+                        cm1, cm2 = st.columns(2)
+                        if cm1.button("Guardar resultado manual", key=f"save_manual_{t['id']}"):
                             try:
-                                set_manual_result(labels[selected_match], result, current_user["id"])
+                                set_manual_result(labels[sel], res, current_user["id"])
                                 st.success("Resultado manual guardado.")
                                 st.rerun()
                             except Exception as exc:
                                 st.error(exc)
-
-                        if cman2.button("Limpiar resultado y volver a pendiente", key=f"clear_manual_result_{t['id']}"):
+                        if cm2.button("Limpiar resultado", key=f"clear_manual_{t['id']}"):
                             try:
-                                clear_match_result(labels[selected_match], current_user["id"])
-                                st.warning("Resultado limpiado. La partida vuelve a pendiente.")
+                                clear_match_result(labels[sel], current_user["id"])
+                                st.warning("Resultado limpiado.")
                                 st.rerun()
                             except Exception as exc:
                                 st.error(exc)
 
-
-            if is_staff(current_user):
-                review_matches = q("""
+                reviews = q("""
                     SELECT m.*, r.number,
-                           wu.chesscom_user white_chess,
-                           bu.chesscom_user black_chess
+                           wu.chesscom_user AS white_chess,
+                           bu.chesscom_user AS black_chess
                     FROM matches m
                     JOIN rounds r ON r.id=m.round_id
                     JOIN users wu ON wu.id=m.white_user_id
                     JOIN users bu ON bu.id=m.black_user_id
-                    WHERE m.tournament_id=? AND m.status='review' AND m.result_type='color_review'
+                    WHERE m.tournament_id=? AND m.status='review'
                     ORDER BY r.number, m.id
                 """, (t["id"],))
-
-                if review_matches:
-                    st.subheader("Partidas jugadas con colores incorrectos")
-                    st.warning("Estas partidas coinciden en jugadores, ritmo, modalidad y fecha, pero se jugaron con colores invertidos.")
-                    for rm in review_matches:
-                        with st.container():
-                            st.write(
-                                f"**R{rm['number']}** | Fixture: `{rm['white_chess']} vs {rm['black_chess']}` | "
-                                f"Resultado si se acepta: **{rm['review_result'] or rm['result']}**"
-                            )
-                            if rm["review_url"]:
-                                st.write(rm["review_url"])
-
-                            ca, cr = st.columns(2)
-                            if ca.button("Aceptar partida", key=f"accept_review_{rm['id']}"):
-                                try:
-                                    accept_color_review(rm["id"], current_user["id"])
-                                    st.success("Partida aceptada y resultado cargado.")
-                                    st.rerun()
-                                except Exception as exc:
-                                    st.error(exc)
-
-                            if cr.button("Rechazar partida", key=f"reject_review_{rm['id']}"):
-                                try:
-                                    reject_color_review(rm["id"], current_user["id"])
-                                    st.warning("Partida rechazada. El cruce vuelve a pendiente.")
-                                    st.rerun()
-                                except Exception as exc:
-                                    st.error(exc)
+                if reviews:
+                    st.subheader("Revisión por colores invertidos")
+                    st.warning("Estas partidas coinciden, pero se jugaron con colores invertidos.")
+                    for rm in reviews:
+                        st.write(f"R{rm['number']} | `{rm['white_chess']} vs {rm['black_chess']}` | Resultado si acepta: **{rm['review_result'] or rm['result']}**")
+                        if rm["review_url"]:
+                            st.write(rm["review_url"])
+                        ca, cr = st.columns(2)
+                        if ca.button("Aceptar partida", key=f"accept_{rm['id']}"):
+                            try:
+                                accept_color_review(rm["id"], current_user["id"])
+                                st.success("Aceptada.")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(exc)
+                        if cr.button("Rechazar partida", key=f"reject_{rm['id']}"):
+                            try:
+                                reject_color_review(rm["id"], current_user["id"])
+                                st.warning("Rechazada.")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(exc)
 
             st.subheader("Rondas")
-            rounds = q("SELECT number,start_datetime,end_datetime FROM rounds WHERE tournament_id=? ORDER BY number", (t["id"],))
-            st.dataframe([dict(r) for r in rounds], use_container_width=True)
+            rounds = q("SELECT number,start_datetime,end_datetime,status FROM rounds WHERE tournament_id=? ORDER BY number", (t["id"],))
+            st.dataframe(rounds, use_container_width=True)
 
             st.subheader("Cruces")
             matches = q("""
                 SELECT m.*, r.number,
-                       wu.display_name white_name, wu.chesscom_user white_chess,
-                       bu.display_name black_name, bu.chesscom_user black_chess
+                       wu.chesscom_user AS white_chess,
+                       bu.chesscom_user AS black_chess
                 FROM matches m
                 JOIN rounds r ON r.id=m.round_id
                 JOIN users wu ON wu.id=m.white_user_id
@@ -1570,62 +1499,8 @@ elif choice == "Torneos":
             st.subheader("Tabla")
             st.dataframe(standings(t["id"]), use_container_width=True)
 
-elif choice == "Mi perfil":
-    st.header("Mi perfil")
-    stats = player_stats(current_user["id"])
-
-    left, right = st.columns([1, 3])
-    if current_user.get("avatar_url"):
-        left.image(current_user["avatar_url"], width=160)
-    right.metric("ELO interno", current_user["elo"])
-    right.write(f"**Nombre:** {current_user['display_name']}")
-    right.write(f"**Chess.com:** {current_user['chesscom_user']}")
-    right.write(f"**Rol:** {current_user['role']}")
-
-    if st.button("Sincronizar avatar con Chess.com"):
-        sync_avatar(current_user["id"], current_user["chesscom_user"])
-        st.rerun()
-
-    st.subheader("Cambiar contraseña")
-    with st.form("change_password"):
-        old = st.text_input("Contraseña actual", type="password")
-        new1 = st.text_input("Nueva contraseña", type="password")
-        new2 = st.text_input("Repetir nueva contraseña", type="password")
-        submitted = st.form_submit_button("Cambiar")
-        if submitted:
-            fresh = get_user(current_user["id"])
-            if fresh["password_hash"] != hash_password(old):
-                st.error("Contraseña actual incorrecta.")
-            elif not new1 or new1 != new2:
-                st.error("Las nuevas contraseñas no coinciden.")
-            else:
-                update_password(current_user["id"], new1, must_change=0)
-                st.success("Contraseña actualizada.")
-
-    st.subheader("Estadísticas")
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("PJ", stats["PJ"])
-    c2.metric("G", stats["G"])
-    c3.metric("E", stats["E"])
-    c4.metric("P", stats["P"])
-    c5.metric("WO", stats["WO"])
-    c6.metric("Rend.", f"{stats['Rendimiento']}%")
-
-elif choice == "Ranking":
-    st.header("Ranking general")
-    users = q("SELECT display_name,chesscom_user,elo,role,account_status,must_change_password FROM users ORDER BY elo DESC")
-    st.dataframe([{
-        "Nombre": u["display_name"],
-        "Chess.com": u["chesscom_user"],
-        "ELO": u["elo"],
-        "Rol": u["role"],
-        "Estado": u["account_status"],
-        "Clave temporal": "Sí" if u["must_change_password"] else "No",
-    } for u in users], use_container_width=True)
-
 elif choice == "Admin usuarios":
     st.header("Admin usuarios")
-
     users = q("SELECT * FROM users ORDER BY role DESC, display_name")
     st.dataframe([{
         "ID": u["id"],
@@ -1638,82 +1513,105 @@ elif choice == "Admin usuarios":
         "Clave temporal": "Sí" if u["must_change_password"] else "No",
     } for u in users], use_container_width=True)
 
-
-    st.subheader("Corregir usuario Chess.com")
-    labels_edit = {f"{u['display_name']} ({u['chesscom_user']})": u["id"] for u in users}
-    if labels_edit:
-        edit_selected = st.selectbox("Perfil a corregir", list(labels_edit.keys()), key="edit_chess_profile")
-        edit_user = get_user(labels_edit[edit_selected])
-
-        current_aliases = q("SELECT alias FROM chess_aliases WHERE user_id=? ORDER BY alias", (edit_user["id"],))
-        st.caption("Alias actuales: " + (", ".join([a["alias"] for a in current_aliases]) if current_aliases else "sin alias"))
-
-        new_chess_name = st.text_input("Nuevo usuario Chess.com principal", value=edit_user["chesscom_user"], key="new_chess_name")
-        new_display_name = st.text_input("Nombre visible", value=edit_user["display_name"], key="new_display_name")
-        keep_alias = st.checkbox("Guardar usuario anterior como alias", value=True, key="keep_old_alias")
-
-        if st.button("Guardar corrección Chess.com"):
-            try:
-                update_user_chess(edit_user["id"], new_chess_name, new_display_name, keep_alias)
-                st.success("Usuario Chess.com corregido.")
-                st.rerun()
-            except Exception as exc:
-                st.error(exc)
-
-        alias_to_add = st.text_input("Agregar alias Chess.com", key="alias_to_add")
-        if st.button("Agregar alias"):
-            try:
-                add_chess_alias(edit_user["id"], alias_to_add)
-                st.success("Alias agregado.")
-                st.rerun()
-            except Exception as exc:
-                st.error(exc)
-
+    labels = {f"{u['display_name']} ({u['chesscom_user']})": u["id"] for u in users}
 
     st.subheader("Crear jugador con clave 12345")
     new_chess = st.text_input("Usuario Chess.com nuevo")
     new_name = st.text_input("Nombre visible opcional")
     if st.button("Crear jugador"):
-        if new_chess:
-            get_or_create_player(new_chess, new_name)
+        try:
+            get_or_create_player(new_chess, new_name or None)
             st.success("Jugador creado o ya existente.")
             st.rerun()
-
-    labels = {f"{u['display_name']} ({u['chesscom_user']})": u["id"] for u in users}
+        except Exception as exc:
+            st.error(exc)
 
     if labels:
+        st.subheader("Corregir usuario Chess.com")
+        target = st.selectbox("Perfil", list(labels.keys()), key="edit_chess_profile")
+        target_user = get_user(labels[target])
+        aliases = q("SELECT alias FROM chess_aliases WHERE user_id=? ORDER BY alias", (target_user["id"],))
+        st.caption("Alias: " + (", ".join([a["alias"] for a in aliases]) if aliases else "sin alias"))
+
+        new_chess_name = st.text_input("Nuevo Chess.com principal", value=target_user["chesscom_user"])
+        new_display = st.text_input("Nombre visible", value=target_user["display_name"])
+        keep_alias = st.checkbox("Guardar anterior como alias", value=True)
+
+        if st.button("Guardar corrección"):
+            try:
+                update_user_chess(target_user["id"], new_chess_name, new_display, keep_alias)
+                st.success("Perfil corregido.")
+                st.rerun()
+            except Exception as exc:
+                st.error(exc)
+
+        alias = st.text_input("Agregar alias")
+        if st.button("Agregar alias"):
+            try:
+                add_chess_alias(target_user["id"], alias)
+                st.success("Alias agregado.")
+                st.rerun()
+            except Exception as exc:
+                st.error(exc)
+
         st.subheader("Resetear contraseña")
-        target = st.selectbox("Usuario", list(labels.keys()), key="reset_user")
+        reset_target = st.selectbox("Usuario a resetear", list(labels.keys()), key="reset_user")
         if st.button("Resetear a 12345"):
-            update_password(labels[target], DEFAULT_PASSWORD, must_change=1)
-            st.success("Contraseña reseteada a 12345.")
+            update_password(labels[reset_target], DEFAULT_PASSWORD, 1)
+            st.success("Contraseña reseteada.")
             st.rerun()
 
         if is_admin(current_user):
-            st.subheader("Cambiar rol / estado")
-            target2 = st.selectbox("Usuario a modificar", list(labels.keys()), key="edit_user")
-            target_user = get_user(labels[target2])
-
-            allowed_roles = ["player", "moderator", "admin"]
-            if is_superadmin(current_user):
-                allowed_roles.append("superadmin")
-
-            new_role = st.selectbox(
-                "Rol",
-                allowed_roles,
-                index=allowed_roles.index(target_user["role"]) if target_user["role"] in allowed_roles else 0,
-            )
-            new_status = st.selectbox(
-                "Estado",
-                ["pending", "active", "suspended"],
-                index=["pending", "active", "suspended"].index(target_user["account_status"]) if target_user["account_status"] in ["pending", "active", "suspended"] else 1,
-            )
-            new_elo = st.number_input("ELO", value=int(target_user["elo"]), step=10)
+            st.subheader("Cambiar rol / estado / ELO")
+            edit_target = st.selectbox("Usuario a modificar", list(labels.keys()), key="edit_user")
+            edit_user = get_user(labels[edit_target])
+            roles = ["player", "moderator", "admin"] + (["superadmin"] if is_superadmin(current_user) else [])
+            role = st.selectbox("Rol", roles, index=roles.index(edit_user["role"]) if edit_user["role"] in roles else 0)
+            status = st.selectbox("Estado", ["pending", "active", "suspended"], index=["pending", "active", "suspended"].index(edit_user["account_status"]) if edit_user["account_status"] in ["pending", "active", "suspended"] else 1)
+            elo = st.number_input("ELO", value=int(edit_user["elo"]), step=10)
 
             if st.button("Guardar usuario"):
-                if target_user["id"] == current_user["id"] and current_user["role"] == "superadmin" and new_role != "superadmin":
-                    st.error("No te podés quitar superadmin a vos mismo.")
-                else:
-                    exec_sql("UPDATE users SET role=?, account_status=?, elo=? WHERE id=?", (new_role, new_status, int(new_elo), target_user["id"]))
-                    st.success("Usuario actualizado.")
-                    st.rerun()
+                exec_sql("UPDATE users SET role=?, account_status=?, elo=? WHERE id=?", (role, status, int(elo), edit_user["id"]))
+                st.success("Usuario actualizado.")
+                st.rerun()
+
+elif choice == "Mi perfil":
+    st.header("Mi perfil")
+    if current_user.get("avatar_url"):
+        st.image(current_user["avatar_url"], width=150)
+    st.metric("ELO interno", current_user["elo"])
+    st.write(f"**Nombre:** {current_user['display_name']}")
+    st.write(f"**Chess.com:** {current_user['chesscom_user']}")
+    st.write(f"**Rol:** {current_user['role']}")
+
+    if st.button("Sincronizar avatar"):
+        sync_avatar(current_user["id"], current_user["chesscom_user"])
+        st.rerun()
+
+    st.subheader("Cambiar contraseña")
+    with st.form("change_password"):
+        old = st.text_input("Contraseña actual", type="password")
+        p1 = st.text_input("Nueva contraseña", type="password")
+        p2 = st.text_input("Repetir nueva contraseña", type="password")
+        ok = st.form_submit_button("Cambiar")
+        if ok:
+            fresh = get_user(current_user["id"])
+            if fresh["password_hash"] != hash_password(old):
+                st.error("Contraseña actual incorrecta.")
+            elif not p1 or p1 != p2:
+                st.error("Las nuevas contraseñas no coinciden.")
+            else:
+                update_password(current_user["id"], p1, 0)
+                st.success("Contraseña cambiada.")
+
+elif choice == "Ranking":
+    st.header("Ranking")
+    users = q("SELECT display_name,chesscom_user,elo,role,account_status,must_change_password FROM users ORDER BY elo DESC")
+    st.dataframe([{
+        "Nombre": u["display_name"],
+        "Chess.com": u["chesscom_user"],
+        "ELO": u["elo"],
+        "Rol": u["role"],
+        "Estado": u["account_status"],
+        "Clave temporal": "Sí" if u["must_change_password"] else "No",
+    } for u in users], use_container_width=True)
