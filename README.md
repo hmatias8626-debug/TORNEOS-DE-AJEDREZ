@@ -1,12 +1,9 @@
-# TORNEOS-DE-AJEDREZ V7.3
+# TORNEOS-DE-AJEDREZ V7.4
 
 Agrega:
-- Motor automático cada 1 minuto por torneo.
-- Carga/modificación manual de resultados.
-- Limpiar resultado y volver a pendiente.
-- Registro/reclamo de cuenta exige usuario real de Chess.com.
-- Mantiene corrección de usuarios y alias en Admin usuarios.
-
-Notas:
-- La auto-búsqueda corre mientras la app está abierta.
-- Para detección real: usuario, colores, ritmo, clase, modalidad y fechas deben coincidir.
+- Si la partida se jugó con colores invertidos, no la carga automáticamente.
+- La deja en revisión.
+- Staff puede aceptar o rechazar.
+- Al aceptar, el resultado se asigna por jugador ganador, no por color real.
+- Detecta usuarios inexistentes en Chess.com y lo informa en el diagnóstico.
+- Busca partidas por ambos jugadores, no solo por blancas.

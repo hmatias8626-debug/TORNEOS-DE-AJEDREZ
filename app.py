@@ -208,6 +208,10 @@ def init_db():
         ("matches", "result_type", "TEXT DEFAULT 'normal'"),
         ("matches", "locked", "INTEGER DEFAULT 0"),
         ("matches", "detected_at", "TEXT"),
+        ("matches", "review_game_uuid", "TEXT"),
+        ("matches", "review_url", "TEXT"),
+        ("matches", "review_result", "TEXT"),
+        ("matches", "rejected_game_uuid", "TEXT"),
     ]
     for table, col, definition in migrations:
         ensure_column(table, col, definition)
@@ -862,6 +866,130 @@ def import_rounds_to_existing_tournament(df, tournament_id):
 
 
 
+
+def score_for_fixture_white(game, fixture_white_user_id, fixture_black_user_id):
+    actual_white = norm(game.get("white", {}).get("username"))
+    actual_score_white = score_for_white(game)
+    if actual_score_white is None:
+        return None
+
+    if username_belongs_to_user(actual_white, fixture_white_user_id):
+        return actual_score_white
+
+    if username_belongs_to_user(actual_white, fixture_black_user_id):
+        if actual_score_white == 0.5:
+            return 0.5
+        return 1.0 - actual_score_white
+
+    return None
+
+
+def game_is_between_players_any_color(game, white_user_id, black_user_id):
+    actual_white = norm(game.get("white", {}).get("username"))
+    actual_black = norm(game.get("black", {}).get("username"))
+
+    exact = username_belongs_to_user(actual_white, white_user_id) and username_belongs_to_user(actual_black, black_user_id)
+    inverted = username_belongs_to_user(actual_white, black_user_id) and username_belongs_to_user(actual_black, white_user_id)
+
+    return exact, inverted
+
+
+def validate_game_without_color(game, tournament, start_dt, end_dt):
+    if game.get("rules") != tournament["rules"]:
+        return False, f"modalidad distinta: {game.get('rules')}"
+
+    if game.get("time_class") != tournament["time_class"]:
+        return False, f"clase distinta: {game.get('time_class')}"
+
+    if str(game.get("time_control")) != str(tournament["time_control"]):
+        return False, f"ritmo distinto: {game.get('time_control')}"
+
+    if tournament["rated_filter"] == "rated" and not game.get("rated"):
+        return False, "no es rated"
+
+    if tournament["rated_filter"] == "casual" and game.get("rated"):
+        return False, "no es casual"
+
+    started = parse_ts(game.get("start_time") or game.get("end_time"))
+    if not started:
+        return False, "sin fecha detectable"
+
+    if started < start_dt:
+        return False, "anterior al rango"
+    if started > end_dt:
+        return False, "posterior al rango"
+
+    return True, "ok"
+
+
+def mark_color_review(match, game):
+    score = score_for_fixture_white(game, match["white_user_id"], match["black_user_id"])
+    if score is None:
+        return False
+
+    result = result_label(score)
+
+    exec_sql("""
+        UPDATE matches
+        SET status='review', result=?, result_type='color_review',
+            review_game_uuid=?, review_url=?, review_result=?,
+            chesscom_url=?, game_uuid=?, detected_at=?
+        WHERE id=?
+    """, (
+        result,
+        game.get("uuid"),
+        game.get("url"),
+        result,
+        game.get("url"),
+        game.get("uuid"),
+        dt.datetime.now().isoformat(timespec="seconds"),
+        match["id"],
+    ))
+
+    return True
+
+
+def accept_color_review(match_id, admin_user_id):
+    match = q("SELECT * FROM matches WHERE id=?", (match_id,), one=True)
+    if not match:
+        raise ValueError("Partida no encontrada.")
+    if match["status"] != "review" or match["result_type"] != "color_review":
+        raise ValueError("Esta partida no está pendiente de revisión por colores invertidos.")
+
+    result = match["review_result"] or match["result"]
+    score = score_from_result_label(result)
+    if score is None:
+        raise ValueError("Resultado de revisión inválido.")
+
+    exec_sql("""
+        UPDATE matches
+        SET status='finished', result=?, result_type='color_inverted_accepted',
+            locked=1, detected_at=?
+        WHERE id=?
+    """, (result, dt.datetime.now().isoformat(timespec="seconds"), match_id))
+
+    apply_elo(match_id, match["white_user_id"], match["black_user_id"], score)
+    audit(admin_user_id, "accept_color_review", f"match={match_id}, result={result}")
+
+
+def reject_color_review(match_id, admin_user_id):
+    match = q("SELECT * FROM matches WHERE id=?", (match_id,), one=True)
+    if not match:
+        raise ValueError("Partida no encontrada.")
+
+    exec_sql("""
+        UPDATE matches
+        SET status='pending', result=NULL, result_type='normal',
+            rejected_game_uuid=review_game_uuid,
+            review_game_uuid=NULL, review_url=NULL, review_result=NULL,
+            chesscom_url=NULL, game_uuid=NULL, locked=0
+        WHERE id=?
+    """, (match_id,))
+
+    audit(admin_user_id, "reject_color_review", f"match={match_id}")
+
+
+
 def scan_tournament(tournament_id):
     tournament = q("SELECT * FROM tournaments WHERE id=?", (tournament_id,), one=True)
     if not tournament:
@@ -884,48 +1012,85 @@ def scan_tournament(tournament_id):
     for match in pending_matches:
         start_dt = dt.datetime.fromisoformat(match["start_datetime"])
         end_dt = dt.datetime.fromisoformat(match["end_datetime"])
-        games = chess_games_between(match["white_chess"], start_dt, end_dt)
-        final_reason = "sin partidas del jugador blanco en el rango"
 
+        white_exists = chess_user_exists(match["white_chess"])
+        black_exists = chess_user_exists(match["black_chess"])
+
+        if not white_exists or not black_exists:
+            missing = []
+            if not white_exists:
+                missing.append(match["white_chess"])
+            if not black_exists:
+                missing.append(match["black_chess"])
+            debug.append({
+                "Cruce": f"{match['white_chess']} vs {match['black_chess']}",
+                "Estado": "usuario inexistente en Chess.com: " + ", ".join(missing)
+            })
+            continue
+
+        games = chess_games_between(match["white_chess"], start_dt, end_dt)
+        # También buscar por el jugador negro por si Chess.com no devuelve bien desde el blanco
+        games += chess_games_between(match["black_chess"], start_dt, end_dt)
+
+        seen = set()
+        unique_games = []
         for game in games:
-            ok, reason = validate_game(
-                game,
-                match["white_user_id"],
-                match["black_user_id"],
-                tournament,
-                start_dt,
-                end_dt,
-            )
-            if not ok:
-                final_reason = reason
+            gid = game.get("uuid") or game.get("url")
+            if gid in seen:
+                continue
+            seen.add(gid)
+            unique_games.append(game)
+
+        final_reason = "sin partidas de los jugadores en el rango"
+
+        for game in unique_games:
+            if match["rejected_game_uuid"] and game.get("uuid") == match["rejected_game_uuid"]:
+                final_reason = "partida invertida rechazada previamente"
                 continue
 
-            score = score_for_white(game)
+            exact, inverted = game_is_between_players_any_color(game, match["white_user_id"], match["black_user_id"])
+            if not exact and not inverted:
+                final_reason = "usuarios no coinciden"
+                continue
+
+            ok_details, detail_reason = validate_game_without_color(game, tournament, start_dt, end_dt)
+            if not ok_details:
+                final_reason = detail_reason
+                continue
+
+            score = score_for_fixture_white(game, match["white_user_id"], match["black_user_id"])
             if score is None:
                 final_reason = "partida encontrada sin resultado interpretable"
                 continue
 
             result = result_label(score)
-            exec_sql("""
-                UPDATE matches
-                SET status='finished', result=?, result_type='normal', chesscom_url=?, game_uuid=?, locked=1, detected_at=?
-                WHERE id=?
-            """, (
-                result,
-                game.get("url"),
-                game.get("uuid"),
-                dt.datetime.now().isoformat(timespec="seconds"),
-                match["id"],
-            ))
-            apply_elo(match["id"], match["white_user_id"], match["black_user_id"], score)
-            found += 1
-            final_reason = "detectada"
-            break
+
+            if exact:
+                exec_sql("""
+                    UPDATE matches
+                    SET status='finished', result=?, result_type='normal',
+                        chesscom_url=?, game_uuid=?, locked=1, detected_at=?
+                    WHERE id=?
+                """, (
+                    result,
+                    game.get("url"),
+                    game.get("uuid"),
+                    dt.datetime.now().isoformat(timespec="seconds"),
+                    match["id"],
+                ))
+                apply_elo(match["id"], match["white_user_id"], match["black_user_id"], score)
+                found += 1
+                final_reason = "detectada"
+                break
+
+            if inverted:
+                if mark_color_review(match, game):
+                    final_reason = "se jugó con colores invertidos: requiere aceptar o rechazar"
+                    break
 
         debug.append({"Cruce": f"{match['white_chess']} vs {match['black_chess']}", "Estado": final_reason})
 
     return found, debug
-
 
 def apply_wo_expired(tournament_id):
     now = dt.datetime.now()
@@ -1039,7 +1204,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("♟️ Torneos de Ajedrez — V7.3")
+st.title("♟️ Torneos de Ajedrez — V7.4")
 
 if not st.session_state.user:
     st.markdown('<div class="login-box">', unsafe_allow_html=True)
@@ -1331,6 +1496,49 @@ elif choice == "Torneos":
                                 st.rerun()
                             except Exception as exc:
                                 st.error(exc)
+
+
+            if is_staff(current_user):
+                review_matches = q("""
+                    SELECT m.*, r.number,
+                           wu.chesscom_user white_chess,
+                           bu.chesscom_user black_chess
+                    FROM matches m
+                    JOIN rounds r ON r.id=m.round_id
+                    JOIN users wu ON wu.id=m.white_user_id
+                    JOIN users bu ON bu.id=m.black_user_id
+                    WHERE m.tournament_id=? AND m.status='review' AND m.result_type='color_review'
+                    ORDER BY r.number, m.id
+                """, (t["id"],))
+
+                if review_matches:
+                    st.subheader("Partidas jugadas con colores incorrectos")
+                    st.warning("Estas partidas coinciden en jugadores, ritmo, modalidad y fecha, pero se jugaron con colores invertidos.")
+                    for rm in review_matches:
+                        with st.container():
+                            st.write(
+                                f"**R{rm['number']}** | Fixture: `{rm['white_chess']} vs {rm['black_chess']}` | "
+                                f"Resultado si se acepta: **{rm['review_result'] or rm['result']}**"
+                            )
+                            if rm["review_url"]:
+                                st.write(rm["review_url"])
+
+                            ca, cr = st.columns(2)
+                            if ca.button("Aceptar partida", key=f"accept_review_{rm['id']}"):
+                                try:
+                                    accept_color_review(rm["id"], current_user["id"])
+                                    st.success("Partida aceptada y resultado cargado.")
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.error(exc)
+
+                            if cr.button("Rechazar partida", key=f"reject_review_{rm['id']}"):
+                                try:
+                                    reject_color_review(rm["id"], current_user["id"])
+                                    st.warning("Partida rechazada. El cruce vuelve a pendiente.")
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.error(exc)
 
             st.subheader("Rondas")
             rounds = q("SELECT number,start_datetime,end_datetime FROM rounds WHERE tournament_id=? ORDER BY number", (t["id"],))
