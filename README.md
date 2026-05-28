@@ -1,21 +1,15 @@
-# TORNEOS-DE-AJEDREZ V10 TEST VISUAL
-
-Versión para rama v10-test.
+# TORNEOS-DE-AJEDREZ V10.1 TEST
 
 Agrega:
-- Vista visual de ronda tipo tabla de ajedrez:
-  ELO | Nombre | Usuario | Pts | vs | Pts | Usuario | Nombre | ELO | Fecha
-- Estados visuales:
-  Finalizada, Pendiente, Revisión, WO, BYE
-- Playoffs / copas visual preliminar:
-  Copa Oro, Plata, Bronce, etc.
-  lados A/B y copa al centro
-- Configuración:
-  cantidad de rondas
-  cantidad de copas
-  clasificados
-  jugadores por copa
-- Optimización:
-  si no hay cruces pendientes, no consulta Chess.com.
-
-No borra datos ni tablas. Solo agrega columnas si faltan.
+- Vista jugador limpia.
+- Torneos abiertos con inscripción automática.
+- Mis torneos solo muestra torneos donde el jugador está inscripto.
+- Panel Admin separado.
+- Cards de destacados:
+  - líder
+  - premio consuelo
+  - mejor racha
+  - racha complicada
+  - rey del empate
+  - más batallador
+- Mantiene visual de rondas, playoffs y optimizaciones de V10.

@@ -12,7 +12,7 @@ import streamlit as st
 APP_TITLE = "Torneos de Ajedrez"
 DEFAULT_PASSWORD = "12345"
 API_BASE = "https://api.chess.com/pub"
-HEADERS = {"User-Agent": "torneos-ajedrez-v10-test-visual/1.0"}
+HEADERS = {"User-Agent": "torneos-ajedrez-v10-1-test-player-admin/1.0"}
 SQLITE_PATH = Path("torneos_ajedrez_local.db")
 
 
@@ -1464,6 +1464,223 @@ def render_playoff_bracket(tournament_id):
 
 
 
+
+def is_registered_in_tournament(tournament_id, user_id):
+    row = q("""
+        SELECT id FROM registrations
+        WHERE tournament_id=? AND user_id=? AND status!='removed'
+    """, (tournament_id, user_id), one=True)
+    return row is not None
+
+
+def open_tournaments_for_player(user_id):
+    return q("""
+        SELECT *
+        FROM tournaments
+        WHERE status IN ('open', 'playing')
+        ORDER BY id DESC
+    """)
+
+
+def my_tournaments(user_id):
+    return q("""
+        SELECT t.*
+        FROM registrations r
+        JOIN tournaments t ON t.id=r.tournament_id
+        WHERE r.user_id=? AND r.status!='removed'
+        ORDER BY t.id DESC
+    """, (user_id,))
+
+
+def register_current_player(tournament_id, user_id):
+    register_player(tournament_id, user_id)
+
+
+def tournament_kpis(tournament_id):
+    players = q("SELECT COUNT(*) AS c FROM registrations WHERE tournament_id=? AND status!='removed'", (tournament_id,), one=True)["c"]
+    matches = q("SELECT COUNT(*) AS c FROM matches WHERE tournament_id=?", (tournament_id,), one=True)["c"]
+    finished = q("SELECT COUNT(*) AS c FROM matches WHERE tournament_id=? AND status='finished'", (tournament_id,), one=True)["c"]
+    pending = q("SELECT COUNT(*) AS c FROM matches WHERE tournament_id=? AND status='pending'", (tournament_id,), one=True)["c"]
+    review = q("SELECT COUNT(*) AS c FROM matches WHERE tournament_id=? AND status='review'", (tournament_id,), one=True)["c"]
+    return {"Jugadores": players, "Cruces": matches, "Finalizadas": finished, "Pendientes": pending, "Revisión": review}
+
+
+def player_match_rows(tournament_id, user_id):
+    return q("""
+        SELECT m.*, r.number,
+               wu.display_name AS white_name, wu.chesscom_user AS white_chess, wu.elo AS white_elo,
+               bu.display_name AS black_name, bu.chesscom_user AS black_chess, bu.elo AS black_elo
+        FROM matches m
+        JOIN rounds r ON r.id=m.round_id
+        JOIN users wu ON wu.id=m.white_user_id
+        LEFT JOIN users bu ON bu.id=m.black_user_id
+        WHERE m.tournament_id=? AND (m.white_user_id=? OR m.black_user_id=?)
+        ORDER BY r.number, m.id
+    """, (tournament_id, user_id, user_id))
+
+
+def result_for_user_in_match(match, user_id):
+    if match["result_type"] == "bye" or match["result"] == "BYE":
+        return "bye" if match["white_user_id"] == user_id else "none"
+    if match["result_type"] == "wo":
+        return "wo"
+    if match["result"] == "1/2-1/2":
+        return "draw"
+    if match["result"] == "1-0":
+        return "win" if match["white_user_id"] == user_id else "loss"
+    if match["result"] == "0-1":
+        return "win" if match["black_user_id"] == user_id else "loss"
+    return "none"
+
+
+def award_cards(tournament_id):
+    table = standings(tournament_id)
+    if not table:
+        return []
+
+    cards = []
+    leader = table[0]
+    cards.append(("👑 Líder", leader["Jugador"], f"{leader['Puntos']} pts · {leader['Chess.com']}"))
+
+    consolation = table[-1]
+    cards.append(("🎁 Premio consuelo", consolation["Jugador"], f"{consolation['Puntos']} pts · a no aflojar"))
+
+    regs = q("""
+        SELECT u.id, u.display_name, u.chesscom_user
+        FROM registrations r
+        JOIN users u ON u.id=r.user_id
+        WHERE r.tournament_id=? AND r.status!='removed'
+    """, (tournament_id,))
+
+    best_win = (0, "-", "-")
+    worst_loss = (0, "-", "-")
+    most_draws = (0, "-", "-")
+    most_games = (0, "-", "-")
+
+    for u in regs:
+        matches = q("""
+            SELECT m.*, r.number
+            FROM matches m
+            JOIN rounds r ON r.id=m.round_id
+            WHERE m.tournament_id=? AND m.status='finished'
+            AND (m.white_user_id=? OR m.black_user_id=?)
+            ORDER BY r.number, m.id
+        """, (tournament_id, u["id"], u["id"]))
+
+        cur_w = max_w = 0
+        cur_l = max_l = 0
+        draws = games = 0
+
+        for m in matches:
+            res = result_for_user_in_match(m, u["id"])
+            if res == "win":
+                cur_w += 1
+                cur_l = 0
+                max_w = max(max_w, cur_w)
+                games += 1
+            elif res == "loss":
+                cur_l += 1
+                cur_w = 0
+                max_l = max(max_l, cur_l)
+                games += 1
+            elif res == "draw":
+                draws += 1
+                games += 1
+                cur_w = 0
+                cur_l = 0
+
+        if max_w > best_win[0]:
+            best_win = (max_w, u["display_name"], u["chesscom_user"])
+        if max_l > worst_loss[0]:
+            worst_loss = (max_l, u["display_name"], u["chesscom_user"])
+        if draws > most_draws[0]:
+            most_draws = (draws, u["display_name"], u["chesscom_user"])
+        if games > most_games[0]:
+            most_games = (games, u["display_name"], u["chesscom_user"])
+
+    if best_win[0] > 0:
+        cards.append(("🔥 Mejor racha", best_win[1], f"{best_win[0]} victorias seguidas"))
+    if worst_loss[0] > 0:
+        cards.append(("🧊 Racha complicada", worst_loss[1], f"{worst_loss[0]} derrotas seguidas"))
+    if most_draws[0] > 0:
+        cards.append(("🤝 Rey del empate", most_draws[1], f"{most_draws[0]} empates"))
+    if most_games[0] > 0:
+        cards.append(("⚔️ Más batallador", most_games[1], f"{most_games[0]} partidas reales"))
+
+    return cards
+
+
+def render_awards(tournament_id):
+    cards = award_cards(tournament_id)
+    if not cards:
+        st.info("Todavía no hay suficientes resultados para mostrar destacados.")
+        return
+
+    cols = st.columns(3)
+    for i, (title, name, detail) in enumerate(cards):
+        with cols[i % 3]:
+            st.markdown(
+                f"""
+                <div class='award-card'>
+                    <div class='award-title'>{title}</div>
+                    <div class='award-name'>{name}</div>
+                    <div class='award-detail'>{detail}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+
+def render_player_tournament_view(tournament, user):
+    st.subheader(tournament["name"])
+    kpis = tournament_kpis(tournament["id"])
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Jugadores", kpis["Jugadores"])
+    c2.metric("Finalizadas", kpis["Finalizadas"])
+    c3.metric("Pendientes", kpis["Pendientes"])
+    c4.metric("Revisión", kpis["Revisión"])
+
+    tabs = st.tabs(["Tabla", "Mis cruces", "Rondas", "Playoffs", "Destacados"])
+
+    with tabs[0]:
+        st.dataframe(standings(tournament["id"]), use_container_width=True, hide_index=True)
+
+    with tabs[1]:
+        rows = player_match_rows(tournament["id"], user["id"])
+        if not rows:
+            st.info("Todavía no tenés cruces cargados.")
+        else:
+            out = []
+            for m in rows:
+                ws, bs = match_score_parts(m.get("result"), m.get("result_type"))
+                out.append({
+                    "Ronda": m["number"],
+                    "Blancas": m["white_chess"],
+                    "Pts": ws,
+                    "VS": "vs",
+                    "Pts ": bs,
+                    "Negras": m["black_chess"] or "LIBRE/BYE",
+                    "Estado": match_status_badge(m["status"], m["result_type"]),
+                    "Link": m["chesscom_url"] or "",
+                })
+            st.dataframe(out, use_container_width=True, hide_index=True)
+
+    with tabs[2]:
+        rounds_for_view = q("SELECT number FROM rounds WHERE tournament_id=? ORDER BY number", (tournament["id"],))
+        if rounds_for_view:
+            selected_round = st.selectbox("Ronda", [int(r["number"]) for r in rounds_for_view], key=f"player_round_{tournament['id']}")
+            st.dataframe(round_visual_rows(tournament["id"], selected_round), use_container_width=True, hide_index=True)
+        else:
+            st.info("Todavía no hay rondas.")
+
+    with tabs[3]:
+        render_playoff_bracket(tournament["id"])
+
+    with tabs[4]:
+        render_awards(tournament["id"])
+
+
 # =========================================================
 # UI
 # =========================================================
@@ -1497,10 +1714,22 @@ st.markdown("""
     margin-top: 36px;
     background: #fff8e6;
 }
+.award-card {
+    border: 1px solid #d7dce2;
+    border-radius: 16px;
+    padding: 16px;
+    margin: 8px 0;
+    background: linear-gradient(180deg, #ffffff, #f5f7fb);
+    box-shadow: 0 1px 4px rgba(0,0,0,.06);
+    min-height: 120px;
+}
+.award-title {font-size: 15px; font-weight: 700; color: #555;}
+.award-name {font-size: 22px; font-weight: 800; margin-top: 8px;}
+.award-detail {font-size: 14px; color: #666; margin-top: 6px;}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("♟️ Torneos de Ajedrez — V10 TEST visual")
+st.title("♟️ Torneos de Ajedrez — V10.1 TEST jugador/admin")
 
 if use_postgres():
     st.sidebar.success("DB: Supabase/PostgreSQL")
@@ -1562,13 +1791,66 @@ if current_user["must_change_password"]:
             st.error("Las contraseñas no coinciden.")
     st.stop()
 
-menu = ["Torneos", "Mi perfil", "Ranking"]
+menu = ["Inicio", "Torneos abiertos", "Mis torneos", "Ranking", "Mi perfil"]
 if is_staff(current_user):
-    menu = ["Torneos", "Crear torneo", "Importar fixture", "Importar rondas", "Admin usuarios", "Mi perfil", "Ranking"]
+    menu.append("⚙ Panel Admin")
 
 choice = st.sidebar.radio("Menú", menu)
 
-if choice == "Crear torneo":
+admin_choice = None
+if choice == "⚙ Panel Admin":
+    admin_choice = st.sidebar.radio(
+        "Panel Admin",
+        ["Torneos Admin", "Crear torneo", "Importar fixture", "Importar rondas", "Admin usuarios"]
+    )
+
+
+if choice == "Inicio":
+    st.header("Inicio")
+    st.caption("Vista jugador: torneos, cruces, tablas y destacados sin mostrar procesos internos.")
+
+    myts = my_tournaments(current_user["id"])
+    if not myts:
+        st.info("Todavía no estás inscripto en ningún torneo. Entrá a Torneos abiertos para inscribirte.")
+    else:
+        for t in myts[:2]:
+            render_player_tournament_view(t, current_user)
+
+elif choice == "Torneos abiertos":
+    st.header("Torneos abiertos")
+    tours = open_tournaments_for_player(current_user["id"])
+    if not tours:
+        st.info("No hay torneos abiertos por ahora.")
+
+    for t in tours:
+        with st.expander(f"{t['name']} — {t['status']} — {t['time_class']} — {t['time_control']}", expanded=True):
+            kpis = tournament_kpis(t["id"])
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Jugadores", kpis["Jugadores"])
+            c2.metric("Cruces", kpis["Cruces"])
+            c3.metric("Pendientes", kpis["Pendientes"])
+
+            if is_registered_in_tournament(t["id"], current_user["id"]):
+                st.success("Ya estás inscripto.")
+            else:
+                if st.button("Inscribirme", key=f"join_{t['id']}"):
+                    register_current_player(t["id"], current_user["id"])
+                    st.success("Inscripción realizada.")
+                    st.rerun()
+
+            st.markdown("**Tabla actual**")
+            st.dataframe(standings(t["id"]), use_container_width=True, hide_index=True)
+
+elif choice == "Mis torneos":
+    st.header("Mis torneos")
+    tours = my_tournaments(current_user["id"])
+    if not tours:
+        st.info("No estás inscripto en ningún torneo todavía.")
+    for t in tours:
+        with st.expander(f"{t['name']} — {t['status']}", expanded=True):
+            render_player_tournament_view(t, current_user)
+
+if admin_choice == "Crear torneo":
     st.header("Crear torneo vacío/manual")
     name = st.text_input("Nombre del torneo")
     desc = st.text_area("Descripción")
@@ -1612,7 +1894,7 @@ if choice == "Crear torneo":
                   rounds_count, cups_count, qualifiers_count, cup_size, tid))
             st.success(f"Torneo creado. ID: {tid}")
 
-elif choice == "Importar fixture":
+elif admin_choice == "Importar fixture":
     st.header("Importar fixture completo")
     st.write("Columnas: `torneo`, `ronda`, `fecha_inicio`, `fecha_fin`, `blancas_chesscom`, `negras_chesscom`. Para jugador libre usá `LIBRE`, `BYE`, vacío o `0` en negras_chesscom.")
 
@@ -1647,7 +1929,7 @@ elif choice == "Importar fixture":
         except Exception as exc:
             st.error(exc)
 
-elif choice == "Importar rondas":
+elif admin_choice == "Importar rondas":
     st.header("Importar rondas a torneo existente")
     tournaments = q("SELECT id,name,time_class,time_control FROM tournaments ORDER BY id DESC")
     if not tournaments:
@@ -1677,8 +1959,8 @@ elif choice == "Importar rondas":
             except Exception as exc:
                 st.error(exc)
 
-elif choice == "Torneos":
-    st.header("Torneos")
+elif admin_choice == "Torneos Admin":
+    st.header("Torneos Admin / Control")
     tournaments = q("SELECT * FROM tournaments ORDER BY id DESC")
     if not tournaments:
         st.info("Todavía no hay torneos.")
@@ -1874,7 +2156,7 @@ elif choice == "Torneos":
             st.subheader("Tabla")
             st.dataframe(standings(t["id"]), use_container_width=True)
 
-elif choice == "Admin usuarios":
+elif admin_choice == "Admin usuarios":
     st.header("Admin usuarios")
     users = q("SELECT * FROM users ORDER BY role DESC, display_name")
     st.dataframe([{
