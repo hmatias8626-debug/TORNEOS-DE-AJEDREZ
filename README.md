@@ -1,9 +1,12 @@
-# TORNEOS-DE-AJEDREZ V7.2
+# TORNEOS-DE-AJEDREZ V7.3
 
-Correcciones:
-- Admin puede corregir usuario Chess.com de cualquier jugador.
-- Admin puede agregar alias Chess.com.
-- El motor acepta alias al detectar partidas.
-- El motor informa mejor colores invertidos.
-- Importación ignora usuarios inválidos como 0, vacío, nan.
-- Normaliza usuarios a minúsculas.
+Agrega:
+- Motor automático cada 1 minuto por torneo.
+- Carga/modificación manual de resultados.
+- Limpiar resultado y volver a pendiente.
+- Registro/reclamo de cuenta exige usuario real de Chess.com.
+- Mantiene corrección de usuarios y alias en Admin usuarios.
+
+Notas:
+- La auto-búsqueda corre mientras la app está abierta.
+- Para detección real: usuario, colores, ritmo, clase, modalidad y fechas deben coincidir.

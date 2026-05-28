@@ -7,6 +7,7 @@ from pathlib import Path
 import pandas as pd
 import requests
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 
 APP_TITLE = "Torneos de Ajedrez"
@@ -269,6 +270,11 @@ def chess_profile(username):
     return None
 
 
+
+def chess_user_exists(chesscom_user):
+    return chess_profile(chesscom_user) is not None
+
+
 def sync_avatar(user_id, chesscom_user):
     profile = chess_profile(chesscom_user)
     if profile and profile.get("avatar"):
@@ -350,6 +356,8 @@ def update_user_chess(user_id, new_chess, new_display=None, add_old_as_alias=Tru
 def create_or_claim_user(username, password, chesscom_user, display_name):
     username = norm(username) or norm(chesscom_user)
     chesscom_user = norm(chesscom_user)
+    if not chess_user_exists(chesscom_user):
+        raise ValueError("Ese usuario no existe en Chess.com. Usá tu usuario real de Chess.com.")
     display_name = display_name.strip() if display_name else username
 
     count = q("SELECT COUNT(*) c FROM users", one=True)["c"]
@@ -960,6 +968,58 @@ def apply_wo_expired(tournament_id):
     return applied
 
 
+
+def score_from_result_label(result):
+    if result == "1-0":
+        return 1.0
+    if result == "0-1":
+        return 0.0
+    if result == "1/2-1/2":
+        return 0.5
+    return None
+
+
+def set_manual_result(match_id, result, admin_user_id, apply_elo_if_pending=True):
+    match = q("SELECT * FROM matches WHERE id=?", (match_id,), one=True)
+    if not match:
+        raise ValueError("Partida no encontrada.")
+
+    old_status = match["status"]
+    old_result = match["result"]
+    score = score_from_result_label(result)
+    if score is None:
+        raise ValueError("Resultado inválido.")
+
+    exec_sql("""
+        UPDATE matches
+        SET status='finished', result=?, result_type='manual', locked=1, detected_at=?
+        WHERE id=?
+    """, (result, dt.datetime.now().isoformat(timespec="seconds"), match_id))
+
+    if old_status != "finished" and apply_elo_if_pending:
+        apply_elo(match_id, match["white_user_id"], match["black_user_id"], score)
+
+    audit(admin_user_id, "manual_result", f"match={match_id}, old={old_result}, new={result}")
+
+
+def clear_match_result(match_id, admin_user_id):
+    match = q("SELECT * FROM matches WHERE id=?", (match_id,), one=True)
+    if not match:
+        raise ValueError("Partida no encontrada.")
+
+    exec_sql("""
+        UPDATE matches
+        SET status='pending', result=NULL, result_type='normal', chesscom_url=NULL, game_uuid=NULL, locked=0, detected_at=NULL
+        WHERE id=?
+    """, (match_id,))
+
+    audit(admin_user_id, "clear_result", f"match={match_id}")
+
+
+def auto_scan_enabled_key(tournament_id):
+    return f"auto_scan_tournament_{tournament_id}"
+
+
 # =========================================================
 # UI
 # =========================================================
@@ -979,7 +1039,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("♟️ Torneos de Ajedrez — V7.2")
+st.title("♟️ Torneos de Ajedrez — V7.3")
 
 if not st.session_state.user:
     st.markdown('<div class="login-box">', unsafe_allow_html=True)
@@ -1005,8 +1065,11 @@ if not st.session_state.user:
             if not chess_user or not new_password:
                 st.warning("Completá usuario Chess.com y contraseña.")
             else:
-                create_or_claim_user(chess_user, new_password, chess_user, display_name or chess_user)
-                st.success("Cuenta creada o reclamada. Ahora ingresá.")
+                try:
+                    create_or_claim_user(chess_user, new_password, chess_user, display_name or chess_user)
+                    st.success("Cuenta creada o reclamada. Ahora ingresá.")
+                except Exception as exc:
+                    st.error(exc)
 
     st.markdown("</div>", unsafe_allow_html=True)
     st.stop()
@@ -1213,6 +1276,61 @@ elif choice == "Torneos":
                     applied = apply_wo_expired(t["id"])
                     st.warning(f"WO aplicados: {applied}")
                     st.rerun()
+
+
+            if is_staff(current_user):
+                with st.expander("Motor automático y resultados manuales"):
+                    auto_key = auto_scan_enabled_key(t["id"])
+                    auto_enabled = st.checkbox(
+                        "Detectar partidas automáticamente cada 1 minuto",
+                        value=st.session_state.get(auto_key, False),
+                        key=auto_key,
+                    )
+
+                    if auto_enabled:
+                        st_autorefresh(interval=60 * 1000, key=f"refresh_scan_{t['id']}")
+                        found_auto, debug_auto = scan_tournament(t["id"])
+                        st.caption(f"Auto-búsqueda ejecutada. Detectadas: {found_auto}")
+                        if debug_auto:
+                            st.dataframe(debug_auto, use_container_width=True)
+
+                    st.markdown("**Cargar o modificar resultado manualmente**")
+                    manual_matches = q("""
+                        SELECT m.*, r.number,
+                               wu.chesscom_user white_chess,
+                               bu.chesscom_user black_chess
+                        FROM matches m
+                        JOIN rounds r ON r.id=m.round_id
+                        JOIN users wu ON wu.id=m.white_user_id
+                        JOIN users bu ON bu.id=m.black_user_id
+                        WHERE m.tournament_id=?
+                        ORDER BY r.number, m.id
+                    """, (t["id"],))
+
+                    if manual_matches:
+                        labels = {
+                            f"R{m['number']} | {m['white_chess']} vs {m['black_chess']} | {m['status']} | {m['result'] or 'sin resultado'}": m["id"]
+                            for m in manual_matches
+                        }
+                        selected_match = st.selectbox("Partida", list(labels.keys()), key=f"manual_match_{t['id']}")
+                        result = st.selectbox("Resultado", ["1-0", "0-1", "1/2-1/2"], key=f"manual_result_{t['id']}")
+
+                        cman1, cman2 = st.columns(2)
+                        if cman1.button("Guardar resultado manual", key=f"save_manual_result_{t['id']}"):
+                            try:
+                                set_manual_result(labels[selected_match], result, current_user["id"])
+                                st.success("Resultado manual guardado.")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(exc)
+
+                        if cman2.button("Limpiar resultado y volver a pendiente", key=f"clear_manual_result_{t['id']}"):
+                            try:
+                                clear_match_result(labels[selected_match], current_user["id"])
+                                st.warning("Resultado limpiado. La partida vuelve a pendiente.")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(exc)
 
             st.subheader("Rondas")
             rounds = q("SELECT number,start_datetime,end_datetime FROM rounds WHERE tournament_id=? ORDER BY number", (t["id"],))
