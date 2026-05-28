@@ -1,4 +1,5 @@
 streamlit
 requests
 pandas
+streamlit_autorefresh
 psycopg2-binary
