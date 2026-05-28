@@ -368,9 +368,15 @@ def column_exists_runtime(table, column):
 
 
 def ensure_column_runtime(table, column, definition):
-    if not column_exists_runtime(table, column):
-        exec_sql(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-
+    if use_postgres():
+        try:
+            exec_sql(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {definition}")
+        except Exception:
+            # Si la columna ya existe o Supabase responde raro, no frenamos la app.
+            pass
+    else:
+        if not column_exists_runtime(table, column):
+            exec_sql(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 def ensure_v9_columns():
     cols = [
@@ -1323,7 +1329,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("♟️ Torneos de Ajedrez — V9 puntos + BYE")
+st.title("♟️ Torneos de Ajedrez — V9.1 puntos + BYE")
 
 if use_postgres():
     st.sidebar.success("DB: Supabase/PostgreSQL")
