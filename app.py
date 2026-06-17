@@ -153,6 +153,13 @@ def init_db():
             playoff_time_class TEXT DEFAULT 'blitz',
             playoff_time_control TEXT DEFAULT '300',
             playoff_rated_filter TEXT DEFAULT 'any',
+            playoff_quarters_time_class TEXT DEFAULT 'rapid',
+            playoff_quarters_time_control TEXT DEFAULT '600+5',
+            playoff_semis_time_class TEXT DEFAULT 'rapid',
+            playoff_semis_time_control TEXT DEFAULT '600+5',
+            playoff_finals_time_class TEXT DEFAULT 'rapid',
+            playoff_finals_time_control TEXT DEFAULT '600+5',
+            playoff_tiebreak_time_control TEXT DEFAULT '300+2',
             win_points REAL DEFAULT 1,
             draw_points REAL DEFAULT 0.5,
             loss_points REAL DEFAULT 0,
@@ -203,6 +210,8 @@ def init_db():
             review_url TEXT,
             review_result TEXT,
             rejected_game_uuid TEXT,
+            playoff_stage TEXT,
+            series_data TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """)
@@ -270,6 +279,13 @@ def init_db():
             playoff_time_class TEXT DEFAULT 'blitz',
             playoff_time_control TEXT DEFAULT '300',
             playoff_rated_filter TEXT DEFAULT 'any',
+            playoff_quarters_time_class TEXT DEFAULT 'rapid',
+            playoff_quarters_time_control TEXT DEFAULT '600+5',
+            playoff_semis_time_class TEXT DEFAULT 'rapid',
+            playoff_semis_time_control TEXT DEFAULT '600+5',
+            playoff_finals_time_class TEXT DEFAULT 'rapid',
+            playoff_finals_time_control TEXT DEFAULT '600+5',
+            playoff_tiebreak_time_control TEXT DEFAULT '300+2',
             win_points REAL DEFAULT 1,
             draw_points REAL DEFAULT 0.5,
             loss_points REAL DEFAULT 0,
@@ -320,6 +336,8 @@ def init_db():
             review_url TEXT,
             review_result TEXT,
             rejected_game_uuid TEXT,
+            playoff_stage TEXT,
+            series_data TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
         """)
@@ -386,6 +404,22 @@ def ensure_v9_columns():
         ("tournaments", "loss_points", "REAL DEFAULT 0"),
         ("tournaments", "bye_points", "REAL DEFAULT 1"),
         ("tournaments", "wo_points", "REAL DEFAULT 0"),
+    ]
+    for table, col, definition in cols:
+        ensure_column_runtime(table, col, definition)
+
+
+def ensure_playoff_columns():
+    cols = [
+        ("tournaments", "playoff_quarters_time_class",   "TEXT DEFAULT 'rapid'"),
+        ("tournaments", "playoff_quarters_time_control", "TEXT DEFAULT '600+5'"),
+        ("tournaments", "playoff_semis_time_class",      "TEXT DEFAULT 'rapid'"),
+        ("tournaments", "playoff_semis_time_control",    "TEXT DEFAULT '600+5'"),
+        ("tournaments", "playoff_finals_time_class",     "TEXT DEFAULT 'rapid'"),
+        ("tournaments", "playoff_finals_time_control",   "TEXT DEFAULT '600+5'"),
+        ("tournaments", "playoff_tiebreak_time_control", "TEXT DEFAULT '300+2'"),
+        ("matches",     "playoff_stage",                 "TEXT"),
+        ("matches",     "series_data",                   "TEXT"),
     ]
     for table, col, definition in cols:
         ensure_column_runtime(table, col, definition)
@@ -843,6 +877,174 @@ def mark_color_review(match, game):
     return True
 
 
+def _tc_to_class(tc_str):
+    try:
+        base = int(str(tc_str).split("+")[0])
+    except Exception:
+        return "rapid"
+    if base < 180:
+        return "bullet"
+    if base < 600:
+        return "blitz"
+    return "rapid"
+
+
+def scan_playoff_match(match, tournament, start_dt, end_dt):
+    import json
+
+    stage = match["playoff_stage"]
+    games_needed = 4 if stage == "finals" else 2
+
+    stage_keys = {
+        "quarters": ("playoff_quarters_time_class", "playoff_quarters_time_control"),
+        "semis":    ("playoff_semis_time_class",    "playoff_semis_time_control"),
+        "finals":   ("playoff_finals_time_class",   "playoff_finals_time_control"),
+    }
+    tc_class_key, tc_val_key = stage_keys.get(stage, stage_keys["quarters"])
+    tc_class = str(tournament.get(tc_class_key) or "rapid")
+    tc_val   = str(tournament.get(tc_val_key)   or "600+5")
+    tb_tc    = str(tournament.get("playoff_tiebreak_time_control") or "300+2")
+    tb_class = _tc_to_class(tb_tc)
+
+    raw = match.get("series_data") or "{}"
+    try:
+        series = json.loads(raw)
+    except Exception:
+        series = {}
+
+    all_game_list = series.get("games", [])
+    found_uuids   = {g["uuid"] for g in all_game_list}
+
+    regular_games = [g for g in all_game_list if not g.get("is_tb")]
+    tb_games      = [g for g in all_game_list if g.get("is_tb")]
+
+    score_w = sum(g["score_w"] for g in regular_games)
+    score_b = len(regular_games) - score_w
+
+    regular_complete = len(regular_games) >= games_needed
+    in_tiebreak = regular_complete and score_w == score_b
+
+    if in_tiebreak:
+        for i in range(0, len(tb_games), 2):
+            pair = tb_games[i:i + 2]
+            if len(pair) == 2:
+                pw = sum(g["score_w"] for g in pair)
+                if pw != len(pair) - pw:
+                    in_tiebreak = False
+                    break
+
+    all_games = chess_games_between(match["white_chess"], start_dt, end_dt)
+    all_games += chess_games_between(match["black_chess"], start_dt, end_dt)
+
+    unique, seen = [], set()
+    for game in all_games:
+        gid = game.get("uuid") or game.get("url")
+        if gid and gid not in seen:
+            seen.add(gid)
+            unique.append(game)
+
+    new_found = False
+
+    for game in unique:
+        gid = game.get("uuid") or game.get("url")
+        if not gid or gid in found_uuids:
+            continue
+
+        if game.get("rules") != tournament.get("rules", "chess"):
+            continue
+
+        started = parse_ts(game.get("start_time") or game.get("end_time"))
+        if not started or started < start_dt or started > end_dt:
+            continue
+
+        exact, inverted = game_is_between_players_any_color(
+            game, match["white_user_id"], match["black_user_id"]
+        )
+        if not exact and not inverted:
+            continue
+
+        actual_tc    = str(game.get("time_control", ""))
+        actual_class = str(game.get("time_class", ""))
+
+        is_tb_game  = (actual_tc == tb_tc  and actual_class == tb_class)
+        is_reg_game = (actual_tc == tc_val and actual_class == tc_class)
+
+        if not is_reg_game and not is_tb_game:
+            continue
+        if is_tb_game and not in_tiebreak:
+            continue
+        if is_reg_game and in_tiebreak:
+            continue
+
+        game_idx = len(tb_games) if in_tiebreak else len(regular_games)
+        white_plays_white = (game_idx % 2 == 0)
+
+        if white_plays_white and not exact:
+            continue
+        if not white_plays_white and not inverted:
+            continue
+
+        score_w_game = score_for_fixture_white(
+            game, match["white_user_id"], match["black_user_id"]
+        )
+        if score_w_game is None:
+            continue
+
+        entry = {"uuid": gid, "url": game.get("url", ""), "score_w": score_w_game, "is_tb": in_tiebreak}
+        all_game_list.append(entry)
+        found_uuids.add(gid)
+        new_found = True
+
+        if in_tiebreak:
+            tb_games.append(entry)
+        else:
+            regular_games.append(entry)
+            score_w += score_w_game
+            score_b += (1 - score_w_game)
+            regular_complete = len(regular_games) >= games_needed
+            in_tiebreak = regular_complete and score_w == score_b
+
+    series["games"] = all_game_list
+    exec_sql("UPDATE matches SET series_data=? WHERE id=?", (json.dumps(series), match["id"]))
+
+    winner_score = None
+    if regular_complete:
+        if score_w > score_b:
+            winner_score = 1.0
+        elif score_b > score_w:
+            winner_score = 0.0
+        else:
+            for i in range(0, len(tb_games), 2):
+                pair = tb_games[i:i + 2]
+                if len(pair) == 2:
+                    pw = sum(g["score_w"] for g in pair)
+                    pb = len(pair) - pw
+                    if pw > pb:
+                        winner_score = 1.0
+                        break
+                    elif pb > pw:
+                        winner_score = 0.0
+                        break
+
+    total = len(all_game_list)
+
+    if winner_score is not None:
+        result = result_label(winner_score)
+        exec_sql("""
+            UPDATE matches SET status='finished', result=?, result_type='playoff',
+                locked=1, detected_at=?
+            WHERE id=?
+        """, (result, dt.datetime.now(), match["id"]))
+        apply_elo(match["id"], match["white_user_id"], match["black_user_id"], winner_score)
+        return True, f"serie finalizada ({total} partida{'s' if total != 1 else ''}) → {result}"
+
+    if total > 0:
+        tb_info = f" +{len(tb_games)}tb" if tb_games else ""
+        return False, f"serie en curso {len(regular_games)}/{games_needed} ({score_w:.1f}-{score_b:.1f}){tb_info}"
+
+    return False, "sin partidas de la serie en el rango"
+
+
 def scan_tournament(tournament_id):
     tournament = q("SELECT * FROM tournaments WHERE id=?", (tournament_id,), one=True)
     if not tournament:
@@ -876,6 +1078,13 @@ def scan_tournament(tournament_id):
             if not black_exists:
                 missing.append(match["black_chess"])
             debug.append({"Cruce": f"{match['white_chess']} vs {match['black_chess']}", "Estado": "usuario inexistente en Chess.com: " + ", ".join(missing)})
+            continue
+
+        if match.get("playoff_stage"):
+            detected, state = scan_playoff_match(match, tournament, start_dt, end_dt)
+            if detected:
+                found += 1
+            debug.append({"Cruce": f"{match['white_chess']} vs {match['black_chess']}", "Estado": state})
             continue
 
         games = chess_games_between(match["white_chess"], start_dt, end_dt)
@@ -1007,11 +1216,14 @@ def import_fixture_csv(df, created_by, rules, time_class, time_control, rated_fi
                 created_players += int(bc)
                 register_player(tournament_id, black_id)
 
-                insert_returning(
-                    "matches",
-                    ["tournament_id", "round_id", "white_user_id", "black_user_id", "status", "locked"],
-                    [tournament_id, round_id, white_id, black_id, "pending", 0],
-                )
+                ps_raw = norm(row.get("playoff_stage", "")) if "playoff_stage" in round_df.columns else ""
+                ps = ps_raw if ps_raw in ("quarters", "semis", "finals") else None
+                m_cols = ["tournament_id", "round_id", "white_user_id", "black_user_id", "status", "locked"]
+                m_vals = [tournament_id, round_id, white_id, black_id, "pending", 0]
+                if ps:
+                    m_cols.append("playoff_stage")
+                    m_vals.append(ps)
+                insert_returning("matches", m_cols, m_vals)
                 created_matches += 1
 
     audit(created_by, "import_fixture", f"matches={created_matches}, players={created_players}")
@@ -1065,11 +1277,14 @@ def import_rounds_to_existing_tournament(df, tournament_id):
             if exists:
                 continue
 
-            insert_returning(
-                "matches",
-                ["tournament_id", "round_id", "white_user_id", "black_user_id", "status", "locked"],
-                [tournament_id, round_id, white_id, black_id, "pending", 0],
-            )
+            ps_raw = norm(row.get("playoff_stage", "")) if "playoff_stage" in round_df.columns else ""
+            ps = ps_raw if ps_raw in ("quarters", "semis", "finals") else None
+            m_cols = ["tournament_id", "round_id", "white_user_id", "black_user_id", "status", "locked"]
+            m_vals = [tournament_id, round_id, white_id, black_id, "pending", 0]
+            if ps:
+                m_cols.append("playoff_stage")
+                m_vals.append(ps)
+            insert_returning("matches", m_cols, m_vals)
             created_matches += 1
 
     exec_sql("UPDATE tournaments SET status='playing' WHERE id=?", (tournament_id,))
@@ -1318,6 +1533,7 @@ def standings(tournament_id):
 
 init_db()
 ensure_v9_columns()
+ensure_playoff_columns()
 
 if "user" not in st.session_state:
     st.session_state.user = None
@@ -1422,12 +1638,37 @@ if choice == "Crear torneo":
     bye_points = pp4.number_input("Libre/BYE", value=1.0, step=0.5, key="ct_bye")
     wo_points = pp5.number_input("WO", value=0.0, step=0.5, key="ct_wo")
 
+    st.subheader("Fase 2 – Eliminatorias")
+    st.caption("Configurá el ritmo de cada etapa por separado. El tiebreak siempre es 5'+2'' (fijo).")
+    tc_opts = ["rapid", "blitz", "bullet"]
+
+    cq1, cq2 = st.columns(2)
+    q_class   = cq1.selectbox("Cuartos – Clase",         tc_opts,   key="ct_q_class")
+    q_control = cq2.text_input("Cuartos – Ritmo exacto", value="600+5", key="ct_q_ctrl")
+
+    cs1, cs2 = st.columns(2)
+    s_class   = cs1.selectbox("Semis – Clase",           tc_opts,   key="ct_s_class")
+    s_control = cs2.text_input("Semis – Ritmo exacto",   value="600+5", key="ct_s_ctrl")
+
+    cf1, cf2 = st.columns(2)
+    f_class   = cf1.selectbox("Final – Clase",                 tc_opts,   key="ct_f_class")
+    f_control = cf2.text_input("Final – Ritmo exacto (4 partidas)", value="600+5", key="ct_f_ctrl")
+
+    st.info("Tiebreak: 5'+2'' · 2 partidas por par · se repite hasta definir ganador")
+
     if st.button("Crear torneo"):
         if not name.strip():
             st.warning("Poné un nombre.")
         else:
             tid = create_empty_tournament(name.strip(), desc, rules, time_class, time_control, rated_filter, strict_colors, current_user["id"])
             exec_sql("UPDATE tournaments SET win_points=?, draw_points=?, loss_points=?, bye_points=?, wo_points=? WHERE id=?", (win_points, draw_points, loss_points, bye_points, wo_points, tid))
+            exec_sql("""UPDATE tournaments SET
+                playoff_quarters_time_class=?, playoff_quarters_time_control=?,
+                playoff_semis_time_class=?,   playoff_semis_time_control=?,
+                playoff_finals_time_class=?,  playoff_finals_time_control=?,
+                playoff_tiebreak_time_control=?
+                WHERE id=?""",
+                (q_class, q_control, s_class, s_control, f_class, f_control, "300+2", tid))
             st.success(f"Torneo creado. ID: {tid}")
 
 elif choice == "Importar fixture":
