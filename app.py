@@ -14,6 +14,7 @@ DEFAULT_PASSWORD = "12345"
 API_BASE = "https://api.chess.com/pub"
 HEADERS = {"User-Agent": "torneos-ajedrez-v9-puntos-bye/1.0"}
 SQLITE_PATH = Path("torneos_ajedrez_local.db")
+ARG_TZ = dt.timezone(dt.timedelta(hours=-3))
 
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
@@ -506,7 +507,8 @@ def chess_games_between(username, start_dt, end_dt):
 
 def parse_ts(timestamp):
     try:
-        return dt.datetime.fromtimestamp(int(timestamp))
+        utc_dt = dt.datetime.fromtimestamp(int(timestamp), tz=dt.timezone.utc)
+        return utc_dt.astimezone(ARG_TZ).replace(tzinfo=None)
     except Exception:
         return None
 
@@ -1152,7 +1154,7 @@ def clear_match_result(match_id, admin_user_id):
 
 
 def apply_wo_expired(tournament_id):
-    now = dt.datetime.now()
+    now = dt.datetime.now(ARG_TZ).replace(tzinfo=None)
     matches = q("""
         SELECT m.*, r.end_datetime
         FROM matches m
