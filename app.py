@@ -35,21 +35,29 @@ def use_postgres():
 
 def pg_conn():
     import psycopg2
-    cached = st.session_state.get("_pg_conn")
-    if cached is not None and cached.closed == 0:
-        return cached
-    c = psycopg2.connect(
-        host=st.secrets["DB_HOST"],
-        port=int(st.secrets["DB_PORT"]),
-        dbname=st.secrets["DB_NAME"],
-        user=st.secrets["DB_USER"],
-        password=st.secrets["DB_PASSWORD"],
-        sslmode="require",
-        connect_timeout=10,
-    )
-    c.autocommit = True
-    st.session_state["_pg_conn"] = c
-    return c
+
+    def _new_conn():
+        c = psycopg2.connect(
+            host=st.secrets["DB_HOST"],
+            port=int(st.secrets["DB_PORT"]),
+            dbname=st.secrets["DB_NAME"],
+            user=st.secrets["DB_USER"],
+            password=st.secrets["DB_PASSWORD"],
+            sslmode="require",
+            connect_timeout=10,
+        )
+        c.autocommit = True
+        return c
+
+    try:
+        cached = st.session_state.get("_pg_conn")
+        if cached is not None and cached.closed == 0:
+            return cached
+        c = _new_conn()
+        st.session_state["_pg_conn"] = c
+        return c
+    except Exception:
+        return _new_conn()
 
 
 def sqlite_conn():
@@ -2580,6 +2588,57 @@ def render_fast_player_tournament_view(tournament, user):
 
     with tabs[4]:
         render_awards(tournament["id"])
+
+
+# =========================================================
+# =========================================================
+# SCHEDULER AUTOMÁTICO
+# =========================================================
+
+import threading as _threading
+_scheduler_lock = _threading.Lock()
+_scheduler_started = False
+
+
+def _auto_scan_all():
+    try:
+        torneos = q("SELECT id FROM tournaments WHERE status='playing'")
+        for t in torneos:
+            try:
+                scan_tournament(t["id"])
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _scheduler_loop():
+    import time as _time
+    fired_keys = set()
+    while True:
+        try:
+            now = dt.datetime.now(ARG_TZ)
+            key = (now.date(), now.hour)
+            if now.hour in (6, 12, 18, 0) and key not in fired_keys:
+                fired_keys.add(key)
+                if len(fired_keys) > 20:
+                    fired_keys = set(list(fired_keys)[-8:])
+                _auto_scan_all()
+        except Exception:
+            pass
+        _time.sleep(30)
+
+
+def _start_scheduler():
+    global _scheduler_started
+    with _scheduler_lock:
+        if not _scheduler_started:
+            _scheduler_started = True
+            t = _threading.Thread(target=_scheduler_loop, daemon=True)
+            t.start()
+
+
+_start_scheduler()
 
 
 # =========================================================
