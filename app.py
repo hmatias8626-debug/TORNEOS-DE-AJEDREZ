@@ -2167,17 +2167,6 @@ def scan_single_match_for_job(tournament, match):
     start_dt = parse_db_datetime(match["start_datetime"])
     end_dt = parse_db_datetime(match["end_datetime"])
 
-    white_exists = chess_user_exists(match["white_chess"])
-    black_exists = chess_user_exists(match["black_chess"])
-
-    if not white_exists or not black_exists:
-        missing = []
-        if not white_exists:
-            missing.append(match["white_chess"])
-        if not black_exists:
-            missing.append(match["black_chess"])
-        return "error", "usuario inexistente en Chess.com: " + ", ".join(missing), ""
-
     games = chess_games_between(match["white_chess"], start_dt, end_dt)
     games += chess_games_between(match["black_chess"], start_dt, end_dt)
 
@@ -2243,6 +2232,15 @@ def run_scan_job(tournament_id, round_number, admin_user_id, progress_placeholde
         update_scan_job_counts(job_id)
         finish_scan_job(job_id)
         return job_id
+
+    if matches:
+        first = matches[0]
+        s_pre = parse_db_datetime(first["start_datetime"])
+        e_pre = parse_db_datetime(first["end_datetime"])
+        all_users = {m["white_chess"] for m in matches} | {m["black_chess"] for m in matches if m["black_chess"]}
+        if progress_placeholder is not None:
+            progress_placeholder.info(f"Pre-cargando partidas de {len(all_users)} jugadores en paralelo...")
+        prefetch_player_games(all_users, s_pre, e_pre)
 
     job_id = create_scan_job(tournament_id, round_number, admin_user_id, len(matches))
 
