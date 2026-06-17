@@ -954,7 +954,12 @@ def validate_game_without_color(game, tournament, start_dt, end_dt):
     if game.get("time_class") != tournament["time_class"]:
         return False, f"clase distinta: {game.get('time_class')}"
 
-    if str(game.get("time_control")) != str(tournament["time_control"]):
+    def _base(tc):
+        try:
+            return int(str(tc).split("+")[0])
+        except Exception:
+            return -1
+    if _base(game.get("time_control")) != _base(tournament["time_control"]):
         return False, f"ritmo distinto: {game.get('time_control')}"
 
     if tournament["rated_filter"] == "rated" and not game.get("rated"):
