@@ -1740,7 +1740,38 @@ def playoff_seed_rows(tournament_id):
     return rows
 
 
+def render_standings_table(table, cup_size=8, cups_count=3):
+    import pandas as pd
+    if not table:
+        st.info("Todavía no hay jugadores en el torneo.")
+        return
+    df = pd.DataFrame(table)
+    df.insert(0, "#", range(1, len(df) + 1))
+
+    def row_style(row):
+        pos = row["#"]
+        if cups_count > 0 and cup_size > 0 and pos % cup_size == 0 and pos <= cup_size * cups_count:
+            return ["border-bottom: 3px solid #555"] * len(row)
+        return [""] * len(row)
+
+    st.dataframe(df.style.apply(row_style, axis=1), use_container_width=True, hide_index=True)
+
+
 def render_playoff_bracket(tournament_id):
+    tournament = q("SELECT * FROM tournaments WHERE id=?", (tournament_id,), one=True) or {}
+    rounds_count = int(tournament.get("rounds_count") or 7)
+
+    total_rounds = q("SELECT COUNT(*) as cnt FROM rounds WHERE tournament_id=?", (tournament_id,), one=True)["cnt"]
+    pending_swiss = q("""
+        SELECT COUNT(*) as cnt FROM matches
+        WHERE tournament_id=? AND status='pending'
+        AND (playoff_stage IS NULL OR playoff_stage='')
+    """, (tournament_id,), one=True)["cnt"]
+
+    if total_rounds < rounds_count or pending_swiss > 0:
+        st.info(f"El bracket se mostrará al terminar las {rounds_count} rondas de la fase regular. Rondas cargadas: {total_rounds}/{rounds_count}.")
+        return
+
     seeds = playoff_seed_rows(tournament_id)
     if not seeds:
         st.info("Todavía no hay clasificados para mostrar.")
@@ -2450,7 +2481,9 @@ def render_fast_player_tournament_view(tournament, user):
     tabs = st.tabs(["Tabla", "Mis cruces", "Rondas", "Playoffs", "Destacados"])
 
     with tabs[0]:
-        st.dataframe(fast_standings(tournament["id"]), use_container_width=True, hide_index=True)
+        cup_size = int(tournament.get("cup_size") or 8)
+        cups_count = int(tournament.get("cups_count") or 3)
+        render_standings_table(fast_standings(tournament["id"]), cup_size, cups_count)
 
     with tabs[1]:
         rows = player_match_rows(tournament["id"], user["id"])
