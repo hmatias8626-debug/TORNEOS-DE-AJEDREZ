@@ -1,12 +1,16 @@
 import datetime as dt
 import hashlib
 import io
+import logging
 import os
 from pathlib import Path
 
 import pandas as pd
 import requests
 import streamlit as st
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 
 APP_TITLE = "Torneos de Ajedrez"
@@ -635,8 +639,9 @@ def chess_profile(username):
         r = requests.get(f"{API_BASE}/player/{norm(username)}", headers=HEADERS, timeout=20)
         if r.status_code == 200:
             return r.json()
-    except Exception:
-        return None
+        logger.warning("chess_profile(%s): HTTP %s", username, r.status_code)
+    except Exception as e:
+        logger.exception("chess_profile(%s): %s", username, e)
     return None
 
 
@@ -656,8 +661,9 @@ def chess_archives(username):
         r = requests.get(f"{API_BASE}/player/{norm(username)}/games/archives", headers=HEADERS, timeout=20)
         if r.status_code == 200:
             return r.json().get("archives", [])
-    except Exception:
-        pass
+        logger.warning("chess_archives(%s): HTTP %s", username, r.status_code)
+    except Exception as e:
+        logger.exception("chess_archives(%s): %s", username, e)
     return []
 
 
@@ -679,8 +685,9 @@ def chess_games_month(url):
         r = requests.get(url, headers=HEADERS, timeout=20)
         if r.status_code == 200:
             return r.json().get("games", [])
-    except Exception:
-        pass
+        logger.warning("chess_games_month(%s): HTTP %s", url, r.status_code)
+    except Exception as e:
+        logger.exception("chess_games_month(%s): %s", url, e)
     return []
 
 
@@ -2606,10 +2613,10 @@ def _auto_scan_all():
         for t in torneos:
             try:
                 scan_tournament(t["id"])
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as e:
+                logger.exception("_auto_scan_all: error escaneando torneo %s: %s", t["id"], e)
+    except Exception as e:
+        logger.exception("_auto_scan_all: error obteniendo torneos: %s", e)
 
 
 def _scheduler_loop():
@@ -2624,8 +2631,8 @@ def _scheduler_loop():
                 if len(fired_keys) > 20:
                     fired_keys = set(list(fired_keys)[-8:])
                 _auto_scan_all()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.exception("_scheduler_loop: error inesperado: %s", e)
         _time.sleep(30)
 
 
