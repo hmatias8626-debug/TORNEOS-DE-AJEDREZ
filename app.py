@@ -12,7 +12,7 @@ import streamlit as st
 APP_TITLE = "Torneos de Ajedrez"
 DEFAULT_PASSWORD = "12345"
 API_BASE = "https://api.chess.com/pub"
-HEADERS = {"User-Agent": "torneos-ajedrez-v9-puntos-bye/1.0"}
+HEADERS = {"User-Agent": "torneos-ajedrez-v10-3-test-reglamento/1.0"}
 SQLITE_PATH = Path("torneos_ajedrez_local.db")
 ARG_TZ = dt.timezone(dt.timedelta(hours=-3))
 
@@ -237,6 +237,64 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS scan_jobs (
+            id SERIAL PRIMARY KEY,
+            tournament_id INTEGER REFERENCES tournaments(id) ON DELETE CASCADE,
+            round_number INTEGER,
+            started_by INTEGER,
+            status TEXT DEFAULT 'running',
+            total_items INTEGER DEFAULT 0,
+            processed_items INTEGER DEFAULT 0,
+            detected_items INTEGER DEFAULT 0,
+            review_items INTEGER DEFAULT 0,
+            started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            finished_at TIMESTAMP
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS scan_job_items (
+            id SERIAL PRIMARY KEY,
+            job_id INTEGER REFERENCES scan_jobs(id) ON DELETE CASCADE,
+            match_id INTEGER,
+            cruce TEXT,
+            status TEXT,
+            detail TEXT,
+            chesscom_url TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS review_reports (
+            id SERIAL PRIMARY KEY,
+            match_id INTEGER REFERENCES matches(id) ON DELETE CASCADE,
+            requested_by INTEGER,
+            reviewed_by INTEGER,
+            status TEXT DEFAULT 'requested',
+            report_text TEXT,
+            decision TEXT,
+            sanctioned_user_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            decided_at TIMESTAMP
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS player_warnings (
+            id SERIAL PRIMARY KEY,
+            tournament_id INTEGER REFERENCES tournaments(id) ON DELETE CASCADE,
+            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            match_id INTEGER,
+            warning_type TEXT,
+            reason TEXT,
+            created_by INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
     else:
         cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -364,6 +422,64 @@ def init_db():
         )
         """)
 
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS scan_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tournament_id INTEGER,
+            round_number INTEGER,
+            started_by INTEGER,
+            status TEXT DEFAULT 'running',
+            total_items INTEGER DEFAULT 0,
+            processed_items INTEGER DEFAULT 0,
+            detected_items INTEGER DEFAULT 0,
+            review_items INTEGER DEFAULT 0,
+            started_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            finished_at TEXT
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS scan_job_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id INTEGER,
+            match_id INTEGER,
+            cruce TEXT,
+            status TEXT,
+            detail TEXT,
+            chesscom_url TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS review_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            match_id INTEGER,
+            requested_by INTEGER,
+            reviewed_by INTEGER,
+            status TEXT DEFAULT 'requested',
+            report_text TEXT,
+            decision TEXT,
+            sanctioned_user_id INTEGER,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            decided_at TEXT
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS player_warnings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tournament_id INTEGER,
+            user_id INTEGER,
+            match_id INTEGER,
+            warning_type TEXT,
+            reason TEXT,
+            created_by INTEGER,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+
     c.commit()
     c.close()
 
@@ -404,6 +520,10 @@ def ensure_v9_columns():
         ("tournaments", "loss_points", "REAL DEFAULT 0"),
         ("tournaments", "bye_points", "REAL DEFAULT 1"),
         ("tournaments", "wo_points", "REAL DEFAULT 0"),
+        ("tournaments", "rounds_count", "INTEGER DEFAULT 0"),
+        ("tournaments", "cups_count", "INTEGER DEFAULT 3"),
+        ("tournaments", "qualifiers_count", "INTEGER DEFAULT 24"),
+        ("tournaments", "cup_size", "INTEGER DEFAULT 8"),
     ]
     for table, col, definition in cols:
         ensure_column_runtime(table, col, definition)
@@ -914,13 +1034,11 @@ def scan_playoff_match(match, tournament, start_dt, end_dt):
 
     all_game_list = series.get("games", [])
     found_uuids   = {g["uuid"] for g in all_game_list}
-
     regular_games = [g for g in all_game_list if not g.get("is_tb")]
     tb_games      = [g for g in all_game_list if g.get("is_tb")]
 
     score_w = sum(g["score_w"] for g in regular_games)
     score_b = len(regular_games) - score_w
-
     regular_complete = len(regular_games) >= games_needed
     in_tiebreak = regular_complete and score_w == score_b
 
@@ -935,7 +1053,6 @@ def scan_playoff_match(match, tournament, start_dt, end_dt):
 
     all_games = chess_games_between(match["white_chess"], start_dt, end_dt)
     all_games += chess_games_between(match["black_chess"], start_dt, end_dt)
-
     unique, seen = [], set()
     for game in all_games:
         gid = game.get("uuid") or game.get("url")
@@ -943,58 +1060,44 @@ def scan_playoff_match(match, tournament, start_dt, end_dt):
             seen.add(gid)
             unique.append(game)
 
-    new_found = False
-
     for game in unique:
         gid = game.get("uuid") or game.get("url")
         if not gid or gid in found_uuids:
             continue
-
         if game.get("rules") != tournament.get("rules", "chess"):
             continue
-
         started = parse_ts(game.get("start_time") or game.get("end_time"))
         if not started or started < start_dt or started > end_dt:
             continue
-
         exact, inverted = game_is_between_players_any_color(
             game, match["white_user_id"], match["black_user_id"]
         )
         if not exact and not inverted:
             continue
-
         actual_tc    = str(game.get("time_control", ""))
         actual_class = str(game.get("time_class", ""))
-
         is_tb_game  = (actual_tc == tb_tc  and actual_class == tb_class)
         is_reg_game = (actual_tc == tc_val and actual_class == tc_class)
-
         if not is_reg_game and not is_tb_game:
             continue
         if is_tb_game and not in_tiebreak:
             continue
         if is_reg_game and in_tiebreak:
             continue
-
         game_idx = len(tb_games) if in_tiebreak else len(regular_games)
         white_plays_white = (game_idx % 2 == 0)
-
         if white_plays_white and not exact:
             continue
         if not white_plays_white and not inverted:
             continue
-
         score_w_game = score_for_fixture_white(
             game, match["white_user_id"], match["black_user_id"]
         )
         if score_w_game is None:
             continue
-
         entry = {"uuid": gid, "url": game.get("url", ""), "score_w": score_w_game, "is_tb": in_tiebreak}
         all_game_list.append(entry)
         found_uuids.add(gid)
-        new_found = True
-
         if in_tiebreak:
             tb_games.append(entry)
         else:
@@ -1027,7 +1130,6 @@ def scan_playoff_match(match, tournament, start_dt, end_dt):
                         break
 
     total = len(all_game_list)
-
     if winner_score is not None:
         result = result_label(winner_score)
         exec_sql("""
@@ -1041,7 +1143,6 @@ def scan_playoff_match(match, tournament, start_dt, end_dt):
     if total > 0:
         tb_info = f" +{len(tb_games)}tb" if tb_games else ""
         return False, f"serie en curso {len(regular_games)}/{games_needed} ({score_w:.1f}-{score_b:.1f}){tb_info}"
-
     return False, "sin partidas de la serie en el rango"
 
 
@@ -1527,6 +1628,877 @@ def standings(tournament_id):
     return table
 
 
+
+def match_score_parts(result, result_type):
+    if result_type == "bye" or result == "BYE":
+        return ("BYE", "")
+    if result_type == "wo" or result == "0-0 WO":
+        return ("WO", "WO")
+    if result == "1-0":
+        return ("1", "0")
+    if result == "0-1":
+        return ("0", "1")
+    if result == "1/2-1/2":
+        return ("½", "½")
+    return ("", "")
+
+
+def match_status_badge(status, result_type):
+    if result_type == "bye":
+        return "🟦 LIBRE"
+    if result_type == "wo":
+        return "🟥 WO"
+    if status == "finished":
+        return "✅ Finalizada"
+    if status == "review":
+        return "🟧 Revisión"
+    if status == "pending":
+        return "⬜ Pendiente"
+    return status
+
+
+def round_visual_rows(tournament_id, round_number):
+    rows = q("""
+        SELECT m.*, r.number, r.start_datetime, r.end_datetime,
+               wu.display_name AS white_name, wu.chesscom_user AS white_chess, wu.elo AS white_elo,
+               bu.display_name AS black_name, bu.chesscom_user AS black_chess, bu.elo AS black_elo
+        FROM matches m
+        JOIN rounds r ON r.id=m.round_id
+        JOIN users wu ON wu.id=m.white_user_id
+        LEFT JOIN users bu ON bu.id=m.black_user_id
+        WHERE m.tournament_id=? AND r.number=?
+        ORDER BY m.id
+    """, (tournament_id, round_number))
+
+    out = []
+    for m in rows:
+        ws, bs = match_score_parts(m.get("result"), m.get("result_type"))
+        out.append({
+            "♙ ELO": m["white_elo"],
+            "Blancas": m["white_name"],
+            "Usuario blancas": m["white_chess"],
+            "Pts": ws,
+            "VS": "vs",
+            "Pts ": bs,
+            "Usuario negras": m["black_chess"] or "LIBRE/BYE",
+            "Negras": m["black_name"] or "LIBRE/BYE",
+            "♟ ELO": m["black_elo"] if m["black_elo"] is not None else "",
+            "Fecha": str(m["start_datetime"])[:10],
+            "Estado": match_status_badge(m["status"], m["result_type"]),
+            "Link": m["chesscom_url"] or "",
+        })
+    return out
+
+
+def pending_count_for_tournament(tournament_id):
+    row = q("""
+        SELECT COUNT(*) AS c
+        FROM matches
+        WHERE tournament_id=? AND status='pending' AND locked=0 AND black_user_id IS NOT NULL
+    """, (tournament_id,), one=True)
+    return int(row["c"]) if row else 0
+
+
+def safe_scan_tournament(tournament_id):
+    pc = pending_count_for_tournament(tournament_id)
+    if pc <= 0:
+        return 0, [{"Cruce": "-", "Estado": "sin cruces pendientes para buscar; no se consulta Chess.com"}]
+    return scan_tournament(tournament_id)
+
+
+def cup_names(count):
+    base = ["Oro", "Plata", "Bronce", "Cobre", "Hierro", "Promoción"]
+    names = []
+    for i in range(count):
+        names.append(base[i] if i < len(base) else f"Copa {i+1}")
+    return names
+
+
+def playoff_seed_rows(tournament_id):
+    table = standings(tournament_id)
+    tournament = q("SELECT * FROM tournaments WHERE id=?", (tournament_id,), one=True) or {}
+    cups_count = int(tournament.get("cups_count") or 3)
+    cup_size = int(tournament.get("cup_size") or 8)
+    names = cup_names(cups_count)
+
+    rows = []
+    pos = 1
+    for ci, cname in enumerate(names):
+        start = ci * cup_size
+        end = start + cup_size
+        for p in table[start:end]:
+            rows.append({
+                "Copa": cname,
+                "Seed": pos,
+                "Jugador": p["Jugador"],
+                "Chess.com": p["Chess.com"],
+                "Puntos": p["Puntos"],
+                "Buchholz": p.get("Buchholz", 0),
+                "ELO": p["ELO"],
+            })
+            pos += 1
+    return rows
+
+
+def render_playoff_bracket(tournament_id):
+    seeds = playoff_seed_rows(tournament_id)
+    if not seeds:
+        st.info("Todavía no hay clasificados para mostrar.")
+        return
+
+    cups = {}
+    for s in seeds:
+        cups.setdefault(s["Copa"], []).append(s)
+
+    for cup, players in cups.items():
+        st.markdown(f"### 🏆 Copa {cup}")
+        st.caption("Vista preliminar por ranking. La llave definitiva se podrá generar cuando cierre la fase regular.")
+
+        half = (len(players) + 1) // 2
+        left = players[:half]
+        right = players[half:][::-1]
+
+        c1, c2, c3 = st.columns([2, 1, 2])
+        with c1:
+            st.markdown("**Lado A**")
+            for p in left:
+                st.markdown(
+                    f"<div class='bracket-box'>#{p['Seed']} · {p['Jugador']}<br><small>{p['Chess.com']} · {p['Puntos']} pts · ELO {p['ELO']}</small></div>",
+                    unsafe_allow_html=True
+                )
+        with c2:
+            st.markdown("<div class='cup-center'>🏆<br>FINAL</div>", unsafe_allow_html=True)
+        with c3:
+            st.markdown("**Lado B**")
+            for p in right:
+                st.markdown(
+                    f"<div class='bracket-box'>#{p['Seed']} · {p['Jugador']}<br><small>{p['Chess.com']} · {p['Puntos']} pts · ELO {p['ELO']}</small></div>",
+                    unsafe_allow_html=True
+                )
+
+
+
+
+def is_registered_in_tournament(tournament_id, user_id):
+    row = q("""
+        SELECT id FROM registrations
+        WHERE tournament_id=? AND user_id=? AND status!='removed'
+    """, (tournament_id, user_id), one=True)
+    return row is not None
+
+
+def open_tournaments_for_player(user_id):
+    return q("""
+        SELECT *
+        FROM tournaments
+        WHERE status IN ('open', 'playing')
+        ORDER BY id DESC
+    """)
+
+
+def my_tournaments(user_id):
+    return q("""
+        SELECT t.*
+        FROM registrations r
+        JOIN tournaments t ON t.id=r.tournament_id
+        WHERE r.user_id=? AND r.status!='removed'
+        ORDER BY t.id DESC
+    """, (user_id,))
+
+
+def register_current_player(tournament_id, user_id):
+    register_player(tournament_id, user_id)
+
+
+def tournament_kpis(tournament_id):
+    players = q("SELECT COUNT(*) AS c FROM registrations WHERE tournament_id=? AND status!='removed'", (tournament_id,), one=True)["c"]
+    matches = q("SELECT COUNT(*) AS c FROM matches WHERE tournament_id=?", (tournament_id,), one=True)["c"]
+    finished = q("SELECT COUNT(*) AS c FROM matches WHERE tournament_id=? AND status='finished'", (tournament_id,), one=True)["c"]
+    pending = q("SELECT COUNT(*) AS c FROM matches WHERE tournament_id=? AND status='pending'", (tournament_id,), one=True)["c"]
+    review = q("SELECT COUNT(*) AS c FROM matches WHERE tournament_id=? AND status='review'", (tournament_id,), one=True)["c"]
+    return {"Jugadores": players, "Cruces": matches, "Finalizadas": finished, "Pendientes": pending, "Revisión": review}
+
+
+def player_match_rows(tournament_id, user_id):
+    return q("""
+        SELECT m.*, r.number,
+               wu.display_name AS white_name, wu.chesscom_user AS white_chess, wu.elo AS white_elo,
+               bu.display_name AS black_name, bu.chesscom_user AS black_chess, bu.elo AS black_elo
+        FROM matches m
+        JOIN rounds r ON r.id=m.round_id
+        JOIN users wu ON wu.id=m.white_user_id
+        LEFT JOIN users bu ON bu.id=m.black_user_id
+        WHERE m.tournament_id=? AND (m.white_user_id=? OR m.black_user_id=?)
+        ORDER BY r.number, m.id
+    """, (tournament_id, user_id, user_id))
+
+
+def result_for_user_in_match(match, user_id):
+    if match["result_type"] == "bye" or match["result"] == "BYE":
+        return "bye" if match["white_user_id"] == user_id else "none"
+    if match["result_type"] == "wo":
+        return "wo"
+    if match["result"] == "1/2-1/2":
+        return "draw"
+    if match["result"] == "1-0":
+        return "win" if match["white_user_id"] == user_id else "loss"
+    if match["result"] == "0-1":
+        return "win" if match["black_user_id"] == user_id else "loss"
+    return "none"
+
+
+def award_cards(tournament_id):
+    table = standings(tournament_id)
+    if not table:
+        return []
+
+    cards = []
+    leader = table[0]
+    cards.append(("👑 Líder", leader["Jugador"], f"{leader['Puntos']} pts · {leader['Chess.com']}"))
+
+    consolation = table[-1]
+    cards.append(("🎁 Premio consuelo", consolation["Jugador"], f"{consolation['Puntos']} pts · a no aflojar"))
+
+    regs = q("""
+        SELECT u.id, u.display_name, u.chesscom_user
+        FROM registrations r
+        JOIN users u ON u.id=r.user_id
+        WHERE r.tournament_id=? AND r.status!='removed'
+    """, (tournament_id,))
+
+    best_win = (0, "-", "-")
+    worst_loss = (0, "-", "-")
+    most_draws = (0, "-", "-")
+    most_games = (0, "-", "-")
+
+    for u in regs:
+        matches = q("""
+            SELECT m.*, r.number
+            FROM matches m
+            JOIN rounds r ON r.id=m.round_id
+            WHERE m.tournament_id=? AND m.status='finished'
+            AND (m.white_user_id=? OR m.black_user_id=?)
+            ORDER BY r.number, m.id
+        """, (tournament_id, u["id"], u["id"]))
+
+        cur_w = max_w = 0
+        cur_l = max_l = 0
+        draws = games = 0
+
+        for m in matches:
+            res = result_for_user_in_match(m, u["id"])
+            if res == "win":
+                cur_w += 1
+                cur_l = 0
+                max_w = max(max_w, cur_w)
+                games += 1
+            elif res == "loss":
+                cur_l += 1
+                cur_w = 0
+                max_l = max(max_l, cur_l)
+                games += 1
+            elif res == "draw":
+                draws += 1
+                games += 1
+                cur_w = 0
+                cur_l = 0
+
+        if max_w > best_win[0]:
+            best_win = (max_w, u["display_name"], u["chesscom_user"])
+        if max_l > worst_loss[0]:
+            worst_loss = (max_l, u["display_name"], u["chesscom_user"])
+        if draws > most_draws[0]:
+            most_draws = (draws, u["display_name"], u["chesscom_user"])
+        if games > most_games[0]:
+            most_games = (games, u["display_name"], u["chesscom_user"])
+
+    if best_win[0] > 0:
+        cards.append(("🔥 Mejor racha", best_win[1], f"{best_win[0]} victorias seguidas"))
+    if worst_loss[0] > 0:
+        cards.append(("🧊 Racha complicada", worst_loss[1], f"{worst_loss[0]} derrotas seguidas"))
+    if most_draws[0] > 0:
+        cards.append(("🤝 Rey del empate", most_draws[1], f"{most_draws[0]} empates"))
+    if most_games[0] > 0:
+        cards.append(("⚔️ Más batallador", most_games[1], f"{most_games[0]} partidas reales"))
+
+    return cards
+
+
+def render_awards(tournament_id):
+    cards = award_cards(tournament_id)
+    if not cards:
+        st.info("Todavía no hay suficientes resultados para mostrar destacados.")
+        return
+
+    cols = st.columns(3)
+    for i, (title, name, detail) in enumerate(cards):
+        with cols[i % 3]:
+            st.markdown(
+                f"""
+                <div class='award-card'>
+                    <div class='award-title'>{title}</div>
+                    <div class='award-name'>{name}</div>
+                    <div class='award-detail'>{detail}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+
+def render_player_tournament_view(tournament, user):
+    st.subheader(tournament["name"])
+    kpis = tournament_kpis(tournament["id"])
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Jugadores", kpis["Jugadores"])
+    c2.metric("Finalizadas", kpis["Finalizadas"])
+    c3.metric("Pendientes", kpis["Pendientes"])
+    c4.metric("Revisión", kpis["Revisión"])
+
+    tabs = st.tabs(["Tabla", "Mis cruces", "Rondas", "Playoffs", "Destacados"])
+
+    with tabs[0]:
+        st.dataframe(standings(tournament["id"]), use_container_width=True, hide_index=True)
+
+    with tabs[1]:
+        rows = player_match_rows(tournament["id"], user["id"])
+        if not rows:
+            st.info("Todavía no tenés cruces cargados.")
+        else:
+            out = []
+            for m in rows:
+                ws, bs = match_score_parts(m.get("result"), m.get("result_type"))
+                out.append({
+                    "Ronda": m["number"],
+                    "Blancas": m["white_chess"],
+                    "Pts": ws,
+                    "VS": "vs",
+                    "Pts ": bs,
+                    "Negras": m["black_chess"] or "LIBRE/BYE",
+                    "Estado": match_status_badge(m["status"], m["result_type"]),
+                    "Link": m["chesscom_url"] or "",
+                })
+            st.dataframe(out, use_container_width=True, hide_index=True)
+
+    with tabs[2]:
+        rounds_for_view = q("SELECT number FROM rounds WHERE tournament_id=? ORDER BY number", (tournament["id"],))
+        if rounds_for_view:
+            selected_round = st.selectbox("Ronda", [int(r["number"]) for r in rounds_for_view], key=f"player_round_{tournament['id']}")
+            st.dataframe(round_visual_rows(tournament["id"], selected_round), use_container_width=True, hide_index=True)
+        else:
+            st.info("Todavía no hay rondas.")
+
+    with tabs[3]:
+        render_playoff_bracket(tournament["id"])
+
+    with tabs[4]:
+        render_awards(tournament["id"])
+
+
+
+def create_scan_job(tournament_id, round_number, started_by, total_items):
+    return insert_returning(
+        "scan_jobs",
+        ["tournament_id", "round_number", "started_by", "status", "total_items", "processed_items", "detected_items", "review_items"],
+        [tournament_id, round_number, started_by, "running", total_items, 0, 0, 0],
+    )
+
+
+def finish_scan_job(job_id, status="finished"):
+    exec_sql("UPDATE scan_jobs SET status=?, finished_at=? WHERE id=?", (status, dt.datetime.now(), job_id))
+
+
+def add_scan_item(job_id, match_id, cruce, status, detail="", chesscom_url=""):
+    return insert_returning(
+        "scan_job_items",
+        ["job_id", "match_id", "cruce", "status", "detail", "chesscom_url", "updated_at"],
+        [job_id, match_id, cruce, status, detail, chesscom_url, dt.datetime.now()],
+    )
+
+
+def update_scan_job_counts(job_id):
+    counts = q("""
+        SELECT
+            COUNT(*) AS processed,
+            SUM(CASE WHEN status='detectada' THEN 1 ELSE 0 END) AS detected,
+            SUM(CASE WHEN status='revision' THEN 1 ELSE 0 END) AS review
+        FROM scan_job_items
+        WHERE job_id=?
+    """, (job_id,), one=True)
+
+    exec_sql("""
+        UPDATE scan_jobs
+        SET processed_items=?, detected_items=?, review_items=?
+        WHERE id=?
+    """, (
+        int(counts.get("processed") or 0),
+        int(counts.get("detected") or 0),
+        int(counts.get("review") or 0),
+        job_id,
+    ))
+
+
+def latest_scan_jobs(tournament_id, limit=5):
+    return q("""
+        SELECT * FROM scan_jobs
+        WHERE tournament_id=?
+        ORDER BY id DESC
+        LIMIT ?
+    """, (tournament_id, limit))
+
+
+def scan_job_items(job_id):
+    return q("""
+        SELECT cruce,status,detail,chesscom_url,updated_at
+        FROM scan_job_items
+        WHERE job_id=?
+        ORDER BY id
+    """, (job_id,))
+
+
+def pending_matches_for_scan(tournament_id, round_number=None):
+    params = [tournament_id]
+    round_filter = ""
+    if round_number:
+        round_filter = " AND r.number=? "
+        params.append(round_number)
+
+    return q(f"""
+        SELECT m.*, r.number, r.start_datetime, r.end_datetime,
+               wu.chesscom_user AS white_chess,
+               bu.chesscom_user AS black_chess
+        FROM matches m
+        JOIN rounds r ON r.id=m.round_id
+        JOIN users wu ON wu.id=m.white_user_id
+        LEFT JOIN users bu ON bu.id=m.black_user_id
+        WHERE m.tournament_id=?
+          AND m.status='pending'
+          AND m.locked=0
+          AND m.black_user_id IS NOT NULL
+          {round_filter}
+        ORDER BY r.number, m.id
+    """, tuple(params))
+
+
+def scan_single_match_for_job(tournament, match):
+    start_dt = parse_db_datetime(match["start_datetime"])
+    end_dt = parse_db_datetime(match["end_datetime"])
+
+    white_exists = chess_user_exists(match["white_chess"])
+    black_exists = chess_user_exists(match["black_chess"])
+
+    if not white_exists or not black_exists:
+        missing = []
+        if not white_exists:
+            missing.append(match["white_chess"])
+        if not black_exists:
+            missing.append(match["black_chess"])
+        return "error", "usuario inexistente en Chess.com: " + ", ".join(missing), ""
+
+    games = chess_games_between(match["white_chess"], start_dt, end_dt)
+    games += chess_games_between(match["black_chess"], start_dt, end_dt)
+
+    unique = []
+    seen = set()
+    for game in games:
+        gid = game.get("uuid") or game.get("url")
+        if gid in seen:
+            continue
+        seen.add(gid)
+        unique.append(game)
+
+    final_reason = "sin partidas de los jugadores en el rango"
+
+    for game in unique:
+        if match.get("rejected_game_uuid") and game.get("uuid") == match.get("rejected_game_uuid"):
+            final_reason = "partida invertida rechazada previamente"
+            continue
+
+        exact, inverted = game_is_between_players_any_color(game, match["white_user_id"], match["black_user_id"])
+        if not exact and not inverted:
+            final_reason = "usuarios no coinciden"
+            continue
+
+        ok, reason = validate_game_without_color(game, tournament, start_dt, end_dt)
+        if not ok:
+            final_reason = reason
+            continue
+
+        score = score_for_fixture_white(game, match["white_user_id"], match["black_user_id"])
+        if score is None:
+            final_reason = "partida encontrada sin resultado interpretable"
+            continue
+
+        result = result_label(score)
+
+        if exact:
+            exec_sql("""
+                UPDATE matches
+                SET status='finished', result=?, result_type='normal',
+                    chesscom_url=?, game_uuid=?, locked=1, detected_at=?
+                WHERE id=?
+            """, (result, game.get("url"), game.get("uuid"), dt.datetime.now(), match["id"]))
+            apply_elo(match["id"], match["white_user_id"], match["black_user_id"], score)
+            return "detectada", f"resultado cargado: {result}", game.get("url") or ""
+
+        if inverted:
+            if mark_color_review(match, game):
+                return "revision", "colores invertidos: requiere aceptar o rechazar", game.get("url") or ""
+
+    return "pendiente", final_reason, ""
+
+
+def run_scan_job(tournament_id, round_number, admin_user_id, progress_placeholder=None):
+    tournament = q("SELECT * FROM tournaments WHERE id=?", (tournament_id,), one=True)
+    if not tournament:
+        raise ValueError("Torneo no encontrado.")
+
+    matches = pending_matches_for_scan(tournament_id, round_number)
+    if not matches:
+        job_id = create_scan_job(tournament_id, round_number, admin_user_id, 0)
+        add_scan_item(job_id, None, "-", "sin_pendientes", "No hay cruces pendientes. No se consultó Chess.com.", "")
+        update_scan_job_counts(job_id)
+        finish_scan_job(job_id)
+        return job_id
+
+    job_id = create_scan_job(tournament_id, round_number, admin_user_id, len(matches))
+
+    for idx, match in enumerate(matches, start=1):
+        cruce = f"R{match['number']} | {match['white_chess']} vs {match['black_chess']}"
+        add_scan_item(job_id, match["id"], cruce, "buscando", "Consultando Chess.com...", "")
+        update_scan_job_counts(job_id)
+
+        if progress_placeholder is not None:
+            progress_placeholder.info(f"Buscando {idx}/{len(matches)}: {cruce}")
+
+        try:
+            status, detail, url = scan_single_match_for_job(tournament, match)
+        except Exception as exc:
+            status, detail, url = "error", str(exc), ""
+
+        add_scan_item(job_id, match["id"], cruce, status, detail, url)
+        update_scan_job_counts(job_id)
+
+    finish_scan_job(job_id)
+    return job_id
+
+
+def render_motor_panel():
+    st.header("Motor Chess.com")
+    st.caption("Este panel es solo para admin. La vista jugador siempre muestra la última información guardada y no ve este proceso.")
+
+    tournaments = q("SELECT id,name,status,time_class,time_control FROM tournaments ORDER BY id DESC")
+    if not tournaments:
+        st.info("No hay torneos.")
+        return
+
+    labels = {f"{t['name']} — {t['status']} — {t['time_class']} {t['time_control']}": t["id"] for t in tournaments}
+    selected = st.selectbox("Torneo", list(labels.keys()), key="motor_tournament")
+    tid = labels[selected]
+
+    rounds = q("SELECT number,start_datetime,end_datetime FROM rounds WHERE tournament_id=? ORDER BY number", (tid,))
+    round_options = ["Todo el torneo"] + [f"Ronda {int(r['number'])}" for r in rounds]
+    round_selected = st.selectbox("Alcance", round_options, key="motor_round")
+
+    round_number = None
+    if round_selected.startswith("Ronda"):
+        round_number = int(round_selected.split(" ")[1])
+
+    pending = pending_matches_for_scan(tid, round_number)
+    st.metric("Cruces pendientes a escanear", len(pending))
+
+    if len(pending) == 0:
+        st.success("No hay cruces pendientes. No hace falta consultar Chess.com.")
+
+    progress_box = st.empty()
+
+    if st.button("Ejecutar motor ahora", key="run_scan_job"):
+        with st.spinner("Ejecutando motor. La vista jugador no se bloquea para otros usuarios."):
+            job_id = run_scan_job(tid, round_number, current_user["id"], progress_box)
+        st.success(f"Motor finalizado. Job #{job_id}")
+        st.rerun()
+
+    st.subheader("Últimas búsquedas")
+    jobs = latest_scan_jobs(tid, 5)
+    if not jobs:
+        st.info("Todavía no hay búsquedas registradas.")
+        return
+
+    st.dataframe(jobs, use_container_width=True, hide_index=True)
+
+    selected_job_label = st.selectbox(
+        "Ver detalle de búsqueda",
+        [f"Job {j['id']} — {j['status']} — {j['processed_items']}/{j['total_items']}" for j in jobs],
+        key="scan_job_detail_select",
+    )
+    selected_job_id = int(selected_job_label.split(" ")[1])
+    items = scan_job_items(selected_job_id)
+    st.dataframe(items, use_container_width=True, hide_index=True)
+
+
+
+# =========================================================
+# V10.3 FAST VIEWS / REVIEWS / SANCTIONS
+# =========================================================
+
+@st.cache_data(ttl=20)
+def cached_standings_for_tournament(tournament_id, revision_key=0):
+    return standings(tournament_id)
+
+
+def tournament_revision_key(tournament_id):
+    row = q("""
+        SELECT COUNT(*) AS c FROM matches
+        WHERE tournament_id=? AND status='finished'
+    """, (tournament_id,), one=True)
+    return int(row["c"] if row else 0)
+
+
+def fast_standings(tournament_id):
+    return cached_standings_for_tournament(tournament_id, tournament_revision_key(tournament_id))
+
+
+def request_match_review(match_id, requested_by):
+    existing = q("""
+        SELECT id FROM review_reports
+        WHERE match_id=? AND status IN ('requested','running')
+        ORDER BY id DESC
+        LIMIT 1
+    """, (match_id,), one=True)
+    if existing:
+        return existing["id"]
+
+    return insert_returning(
+        "review_reports",
+        ["match_id", "requested_by", "status", "report_text"],
+        [match_id, requested_by, "requested", "Revisión solicitada. Pendiente de análisis admin/Stockfish."],
+    )
+
+
+def review_reports_for_match(match_id):
+    return q("""
+        SELECT rr.*, u.display_name AS requested_by_name
+        FROM review_reports rr
+        LEFT JOIN users u ON u.id=rr.requested_by
+        WHERE rr.match_id=?
+        ORDER BY rr.id DESC
+    """, (match_id,))
+
+
+def requested_reviews():
+    return q("""
+        SELECT rr.*, m.tournament_id, m.result, m.chesscom_url,
+               wu.display_name AS white_name, wu.chesscom_user AS white_chess,
+               bu.display_name AS black_name, bu.chesscom_user AS black_chess,
+               t.name AS tournament_name
+        FROM review_reports rr
+        JOIN matches m ON m.id=rr.match_id
+        JOIN tournaments t ON t.id=m.tournament_id
+        JOIN users wu ON wu.id=m.white_user_id
+        LEFT JOIN users bu ON bu.id=m.black_user_id
+        WHERE rr.status IN ('requested','running')
+        ORDER BY rr.id DESC
+    """)
+
+
+def warning_count(tournament_id, user_id):
+    row = q("""
+        SELECT COUNT(*) AS c FROM player_warnings
+        WHERE tournament_id=? AND user_id=?
+    """, (tournament_id, user_id), one=True)
+    return int(row["c"] if row else 0)
+
+
+def add_warning_and_maybe_disqualify(tournament_id, user_id, match_id, warning_type, reason, admin_user_id):
+    insert_returning(
+        "player_warnings",
+        ["tournament_id", "user_id", "match_id", "warning_type", "reason", "created_by"],
+        [tournament_id, user_id, match_id, warning_type, reason, admin_user_id],
+    )
+    cnt = warning_count(tournament_id, user_id)
+    if cnt >= 2:
+        exec_sql("""
+            UPDATE registrations
+            SET status='disqualified'
+            WHERE tournament_id=? AND user_id=?
+        """, (tournament_id, user_id))
+    return cnt
+
+
+def apply_sanction_00(match_id, sanctioned_user_id, admin_user_id, reason):
+    match = q("SELECT * FROM matches WHERE id=?", (match_id,), one=True)
+    if not match:
+        raise ValueError("Partida no encontrada.")
+
+    if sanctioned_user_id not in (match["white_user_id"], match["black_user_id"]):
+        raise ValueError("El jugador sancionado no pertenece a esta partida.")
+
+    # Resultado reglamentario: 0-0. Nadie suma punto. Solo recibe advertencia el sancionado.
+    exec_sql("""
+        UPDATE matches
+        SET status='finished', result='0-0', result_type='sanction_00',
+            locked=1, detected_at=?
+        WHERE id=?
+    """, (dt.datetime.now(), match_id))
+
+    cnt = add_warning_and_maybe_disqualify(
+        match["tournament_id"],
+        sanctioned_user_id,
+        match_id,
+        "sanction",
+        reason,
+        admin_user_id,
+    )
+
+    exec_sql("""
+        UPDATE review_reports
+        SET status='decided', reviewed_by=?, decision=?, sanctioned_user_id=?, decided_at=?
+        WHERE match_id=? AND status IN ('requested','running')
+    """, (admin_user_id, "sanction_00", sanctioned_user_id, dt.datetime.now(), match_id))
+
+    audit(admin_user_id, "sanction_00", f"match={match_id}, sanctioned={sanctioned_user_id}, warnings={cnt}")
+    return cnt
+
+
+def mark_review_no_sanction(match_id, admin_user_id, note="Resultado mantenido. Sin sanción."):
+    exec_sql("""
+        UPDATE review_reports
+        SET status='decided', reviewed_by=?, decision='no_sanction', report_text=?, decided_at=?
+        WHERE match_id=? AND status IN ('requested','running')
+    """, (admin_user_id, note, dt.datetime.now(), match_id))
+    audit(admin_user_id, "review_no_sanction", f"match={match_id}")
+
+
+def player_warnings_table(tournament_id):
+    return q("""
+        SELECT pw.*, u.display_name, u.chesscom_user
+        FROM player_warnings pw
+        JOIN users u ON u.id=pw.user_id
+        WHERE pw.tournament_id=?
+        ORDER BY pw.created_at DESC
+    """, (tournament_id,))
+
+
+def render_review_panel():
+    st.header("Revisiones / Sanciones")
+    st.caption("La revisión se aplica sobre una partida puntual. El resultado sanción es 0-0 y solo recibe advertencia el jugador sancionado.")
+
+    reqs = requested_reviews()
+    if not reqs:
+        st.success("No hay revisiones pendientes.")
+        return
+
+    for r in reqs:
+        with st.expander(f"#{r['id']} · {r['tournament_name']} · {r['white_chess']} vs {r['black_chess']}", expanded=True):
+            st.write(f"Resultado actual: **{r['result']}**")
+            if r.get("chesscom_url"):
+                st.write(r["chesscom_url"])
+
+            st.info("Informe automático completo con Stockfish queda para el siguiente módulo. Acá ya podés decidir reglamentariamente.")
+
+            c1, c2 = st.columns(2)
+            sanctioned_label = c1.selectbox(
+                "Jugador sancionado",
+                [
+                    f"{r['white_name']} ({r['white_chess']})",
+                    f"{r['black_name']} ({r['black_chess']})",
+                ],
+                key=f"sanction_player_{r['id']}",
+            )
+            sanctioned_id = None
+            if sanctioned_label.startswith(str(r["white_name"])):
+                # match needs ids, fetch match
+                m = q("SELECT * FROM matches WHERE id=?", (r["match_id"],), one=True)
+                sanctioned_id = m["white_user_id"]
+            else:
+                m = q("SELECT * FROM matches WHERE id=?", (r["match_id"],), one=True)
+                sanctioned_id = m["black_user_id"]
+
+            reason = c2.text_input("Motivo", value="Revisión admin / conducta antirreglamentaria", key=f"sanction_reason_{r['id']}")
+
+            a, b = st.columns(2)
+            if a.button("Aplicar 0-0 y advertencia", key=f"apply_sanction_{r['id']}"):
+                try:
+                    cnt = apply_sanction_00(r["match_id"], sanctioned_id, current_user["id"], reason)
+                    if cnt >= 2:
+                        st.warning(f"Sanción aplicada. El jugador llegó a {cnt} advertencias y queda descalificado.")
+                    else:
+                        st.success(f"Sanción aplicada. Advertencias del jugador: {cnt}/2.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(exc)
+
+            if b.button("Mantener resultado / sin sanción", key=f"no_sanction_{r['id']}"):
+                try:
+                    mark_review_no_sanction(r["match_id"], current_user["id"])
+                    st.success("Resultado mantenido. Revisión cerrada sin sanción.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(exc)
+
+
+def render_fast_player_tournament_view(tournament, user):
+    st.subheader(tournament["name"])
+    kpis = tournament_kpis(tournament["id"])
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Jugadores", kpis["Jugadores"])
+    c2.metric("Finalizadas", kpis["Finalizadas"])
+    c3.metric("Pendientes", kpis["Pendientes"])
+    c4.metric("Revisión", kpis["Revisión"])
+
+    tabs = st.tabs(["Tabla", "Mis cruces", "Rondas", "Playoffs", "Destacados"])
+
+    with tabs[0]:
+        st.dataframe(fast_standings(tournament["id"]), use_container_width=True, hide_index=True)
+
+    with tabs[1]:
+        rows = player_match_rows(tournament["id"], user["id"])
+        if not rows:
+            st.info("Todavía no tenés cruces cargados.")
+        else:
+            out = []
+            for m in rows:
+                ws, bs = match_score_parts(m.get("result"), m.get("result_type"))
+                out.append({
+                    "Ronda": m["number"],
+                    "Blancas": m["white_chess"],
+                    "Pts": ws,
+                    "VS": "vs",
+                    "Pts ": bs,
+                    "Negras": m["black_chess"] or "LIBRE/BYE",
+                    "Estado": match_status_badge(m["status"], m["result_type"]),
+                    "Link": m["chesscom_url"] or "",
+                })
+            st.dataframe(out, use_container_width=True, hide_index=True)
+
+            finished_with_links = [m for m in rows if m.get("chesscom_url") and m["status"] == "finished"]
+            if finished_with_links:
+                st.markdown("**Solicitar revisión de una partida**")
+                labels = {
+                    f"R{m['number']} | {m['white_chess']} vs {m['black_chess']} | {m['result']}": m["id"]
+                    for m in finished_with_links
+                }
+                sel = st.selectbox("Partida a reportar", list(labels.keys()), key=f"request_review_{tournament['id']}_{user['id']}")
+                if st.button("Solicitar revisión", key=f"btn_request_review_{tournament['id']}_{user['id']}"):
+                    rid = request_match_review(labels[sel], user["id"])
+                    st.success(f"Revisión solicitada. ID #{rid}. Un admin decidirá si corresponde analizar/sancionar.")
+
+    with tabs[2]:
+        rounds_for_view = q("SELECT number FROM rounds WHERE tournament_id=? ORDER BY number", (tournament["id"],))
+        if rounds_for_view:
+            selected_round = st.selectbox("Ronda", [int(r["number"]) for r in rounds_for_view], key=f"fast_round_{tournament['id']}")
+            st.dataframe(round_visual_rows(tournament["id"], selected_round), use_container_width=True, hide_index=True)
+        else:
+            st.info("Todavía no hay rondas.")
+
+    with tabs[3]:
+        render_playoff_bracket(tournament["id"])
+
+    with tabs[4]:
+        render_awards(tournament["id"])
+
+
 # =========================================================
 # UI
 # =========================================================
@@ -1540,14 +2512,43 @@ if "user" not in st.session_state:
 
 st.markdown("""
 <style>
-.block-container {max-width: 1200px;}
+.block-container {max-width: 1320px;}
 .login-box {max-width: 440px; margin: 0 auto;}
 .login-box [data-testid="stTextInput"] {max-width: 440px;}
 .login-box .stButton button {width: 180px;}
+.bracket-box {
+    border: 1px solid #d7dce2;
+    border-radius: 12px;
+    padding: 10px 12px;
+    margin: 8px 0;
+    background: linear-gradient(180deg, #ffffff, #f7f9fc);
+    box-shadow: 0 1px 3px rgba(0,0,0,.05);
+}
+.cup-center {
+    text-align: center;
+    font-size: 28px;
+    border: 1px solid #d7dce2;
+    border-radius: 16px;
+    padding: 24px 8px;
+    margin-top: 36px;
+    background: #fff8e6;
+}
+.award-card {
+    border: 1px solid #d7dce2;
+    border-radius: 16px;
+    padding: 16px;
+    margin: 8px 0;
+    background: linear-gradient(180deg, #ffffff, #f5f7fb);
+    box-shadow: 0 1px 4px rgba(0,0,0,.06);
+    min-height: 120px;
+}
+.award-title {font-size: 15px; font-weight: 700; color: #555;}
+.award-name {font-size: 22px; font-weight: 800; margin-top: 8px;}
+.award-detail {font-size: 14px; color: #666; margin-top: 6px;}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("♟️ Torneos de Ajedrez — V9.1 puntos + BYE")
+st.title("♟️ Torneos de Ajedrez — V10.3 TEST reglamento + vista rápida")
 
 if use_postgres():
     st.sidebar.success("DB: Supabase/PostgreSQL")
@@ -1609,13 +2610,72 @@ if current_user["must_change_password"]:
             st.error("Las contraseñas no coinciden.")
     st.stop()
 
-menu = ["Torneos", "Mi perfil", "Ranking"]
+menu = ["Inicio", "Torneos abiertos", "Mis torneos", "Ranking", "Mi perfil"]
 if is_staff(current_user):
-    menu = ["Torneos", "Crear torneo", "Importar fixture", "Importar rondas", "Admin usuarios", "Mi perfil", "Ranking"]
+    menu.append("⚙ Panel Admin")
 
 choice = st.sidebar.radio("Menú", menu)
 
-if choice == "Crear torneo":
+admin_choice = None
+if choice == "⚙ Panel Admin":
+    admin_choice = st.sidebar.radio(
+        "Panel Admin",
+        ["Torneos Admin", "Motor Chess.com", "Revisiones", "Crear torneo", "Importar fixture", "Importar rondas", "Admin usuarios"]
+    )
+
+
+if choice == "Inicio":
+    st.header("Inicio")
+    st.caption("Vista jugador: torneos, cruces, tablas y destacados sin mostrar procesos internos.")
+
+    myts = my_tournaments(current_user["id"])
+    if not myts:
+        st.info("Todavía no estás inscripto en ningún torneo. Entrá a Torneos abiertos para inscribirte.")
+    else:
+        for t in myts[:2]:
+            render_fast_player_tournament_view(t, current_user)
+
+elif choice == "Torneos abiertos":
+    st.header("Torneos abiertos")
+    tours = open_tournaments_for_player(current_user["id"])
+    if not tours:
+        st.info("No hay torneos abiertos por ahora.")
+
+    for t in tours:
+        with st.expander(f"{t['name']} — {t['status']} — {t['time_class']} — {t['time_control']}", expanded=True):
+            kpis = tournament_kpis(t["id"])
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Jugadores", kpis["Jugadores"])
+            c2.metric("Cruces", kpis["Cruces"])
+            c3.metric("Pendientes", kpis["Pendientes"])
+
+            if is_registered_in_tournament(t["id"], current_user["id"]):
+                st.success("Ya estás inscripto.")
+            else:
+                if st.button("Inscribirme", key=f"join_{t['id']}"):
+                    register_current_player(t["id"], current_user["id"])
+                    st.success("Inscripción realizada.")
+                    st.rerun()
+
+            st.markdown("**Tabla actual**")
+            st.dataframe(fast_standings(t["id"]), use_container_width=True, hide_index=True)
+
+elif choice == "Mis torneos":
+    st.header("Mis torneos")
+    tours = my_tournaments(current_user["id"])
+    if not tours:
+        st.info("No estás inscripto en ningún torneo todavía.")
+    for t in tours:
+        with st.expander(f"{t['name']} — {t['status']}", expanded=True):
+            render_fast_player_tournament_view(t, current_user)
+
+if admin_choice == "Motor Chess.com":
+    render_motor_panel()
+
+elif admin_choice == "Revisiones":
+    render_review_panel()
+
+elif admin_choice == "Crear torneo":
     st.header("Crear torneo vacío/manual")
     name = st.text_input("Nombre del torneo")
     desc = st.text_area("Descripción")
@@ -1630,6 +2690,13 @@ if choice == "Crear torneo":
     ]
     strict_colors = st.checkbox("Respetar colores exactos", value=True)
 
+    st.subheader("Estructura del torneo")
+    et1, et2, et3, et4 = st.columns(4)
+    rounds_count = et1.number_input("Cantidad de rondas", value=5, min_value=1, step=1)
+    cups_count = et2.number_input("Cantidad de copas", value=3, min_value=1, step=1)
+    qualifiers_count = et3.number_input("Clasificados a playoffs", value=24, min_value=2, step=1)
+    cup_size = et4.number_input("Jugadores por copa", value=8, min_value=2, step=2)
+
     st.subheader("Sistema de puntos")
     pp1, pp2, pp3, pp4, pp5 = st.columns(5)
     win_points = pp1.number_input("Victoria", value=1.0, step=0.5, key="ct_win")
@@ -1641,19 +2708,15 @@ if choice == "Crear torneo":
     st.subheader("Fase 2 – Eliminatorias")
     st.caption("Configurá el ritmo de cada etapa por separado. El tiebreak siempre es 5'+2'' (fijo).")
     tc_opts = ["rapid", "blitz", "bullet"]
-
     cq1, cq2 = st.columns(2)
     q_class   = cq1.selectbox("Cuartos – Clase",         tc_opts,   key="ct_q_class")
     q_control = cq2.text_input("Cuartos – Ritmo exacto", value="600+5", key="ct_q_ctrl")
-
     cs1, cs2 = st.columns(2)
     s_class   = cs1.selectbox("Semis – Clase",           tc_opts,   key="ct_s_class")
     s_control = cs2.text_input("Semis – Ritmo exacto",   value="600+5", key="ct_s_ctrl")
-
     cf1, cf2 = st.columns(2)
     f_class   = cf1.selectbox("Final – Clase",                 tc_opts,   key="ct_f_class")
     f_control = cf2.text_input("Final – Ritmo exacto (4 partidas)", value="600+5", key="ct_f_ctrl")
-
     st.info("Tiebreak: 5'+2'' · 2 partidas por par · se repite hasta definir ganador")
 
     if st.button("Crear torneo"):
@@ -1661,7 +2724,13 @@ if choice == "Crear torneo":
             st.warning("Poné un nombre.")
         else:
             tid = create_empty_tournament(name.strip(), desc, rules, time_class, time_control, rated_filter, strict_colors, current_user["id"])
-            exec_sql("UPDATE tournaments SET win_points=?, draw_points=?, loss_points=?, bye_points=?, wo_points=? WHERE id=?", (win_points, draw_points, loss_points, bye_points, wo_points, tid))
+            exec_sql("""
+                UPDATE tournaments
+                SET win_points=?, draw_points=?, loss_points=?, bye_points=?, wo_points=?,
+                    rounds_count=?, cups_count=?, qualifiers_count=?, cup_size=?
+                WHERE id=?
+            """, (win_points, draw_points, loss_points, bye_points, wo_points,
+                  rounds_count, cups_count, qualifiers_count, cup_size, tid))
             exec_sql("""UPDATE tournaments SET
                 playoff_quarters_time_class=?, playoff_quarters_time_control=?,
                 playoff_semis_time_class=?,   playoff_semis_time_control=?,
@@ -1671,7 +2740,7 @@ if choice == "Crear torneo":
                 (q_class, q_control, s_class, s_control, f_class, f_control, "300+2", tid))
             st.success(f"Torneo creado. ID: {tid}")
 
-elif choice == "Importar fixture":
+elif admin_choice == "Importar fixture":
     st.header("Importar fixture completo")
     st.write("Columnas: `torneo`, `ronda`, `fecha_inicio`, `fecha_fin`, `blancas_chesscom`, `negras_chesscom`. Para jugador libre usá `LIBRE`, `BYE`, vacío o `0` en negras_chesscom.")
 
@@ -1706,7 +2775,7 @@ elif choice == "Importar fixture":
         except Exception as exc:
             st.error(exc)
 
-elif choice == "Importar rondas":
+elif admin_choice == "Importar rondas":
     st.header("Importar rondas a torneo existente")
     tournaments = q("SELECT id,name,time_class,time_control FROM tournaments ORDER BY id DESC")
     if not tournaments:
@@ -1736,8 +2805,8 @@ elif choice == "Importar rondas":
             except Exception as exc:
                 st.error(exc)
 
-elif choice == "Torneos":
-    st.header("Torneos")
+elif admin_choice == "Torneos Admin":
+    st.header("Torneos Admin / Control")
     tournaments = q("SELECT * FROM tournaments ORDER BY id DESC")
     if not tournaments:
         st.info("Todavía no hay torneos.")
@@ -1761,6 +2830,13 @@ elif choice == "Torneos":
                     playoff_time = pc1.text_input("Ritmo playoffs", value=str(t["playoff_time_control"]), key=f"ptime_{t['id']}")
                     playoff_class = pc2.selectbox("Clase playoffs", ["rapid", "blitz", "bullet", "daily"], index=["rapid", "blitz", "bullet", "daily"].index(t["playoff_time_class"]) if t["playoff_time_class"] in ["rapid", "blitz", "bullet", "daily"] else 1, key=f"pclass_{t['id']}")
 
+                    st.markdown("**Estructura**")
+                    es1, es2, es3, es4 = st.columns(4)
+                    edit_rounds_count = es1.number_input("Rondas", value=int(t.get("rounds_count", 0) or 0), min_value=0, step=1, key=f"rounds_count_{t['id']}")
+                    edit_cups_count = es2.number_input("Copas", value=int(t.get("cups_count", 3) or 3), min_value=1, step=1, key=f"cups_count_{t['id']}")
+                    edit_qualifiers_count = es3.number_input("Clasificados", value=int(t.get("qualifiers_count", 24) or 24), min_value=2, step=1, key=f"qualifiers_count_{t['id']}")
+                    edit_cup_size = es4.number_input("Por copa", value=int(t.get("cup_size", 8) or 8), min_value=2, step=2, key=f"cup_size_{t['id']}")
+
                     st.markdown("**Sistema de puntos**")
                     pp1, pp2, pp3, pp4, pp5 = st.columns(5)
                     edit_win = pp1.number_input("Victoria", value=float(t.get("win_points", 1) or 1), step=0.5, key=f"win_{t['id']}")
@@ -1773,10 +2849,12 @@ elif choice == "Torneos":
                         exec_sql("""
                             UPDATE tournaments
                             SET time_control=?, time_class=?, strict_colors=?, playoff_time_control=?, playoff_time_class=?,
-                                win_points=?, draw_points=?, loss_points=?, bye_points=?, wo_points=?
+                                win_points=?, draw_points=?, loss_points=?, bye_points=?, wo_points=?,
+                                rounds_count=?, cups_count=?, qualifiers_count=?, cup_size=?
                             WHERE id=?
                         """, (new_time, new_class, 1 if strict else 0, playoff_time, playoff_class,
-                              edit_win, edit_draw, edit_loss, edit_bye, edit_wo, t["id"]))
+                              edit_win, edit_draw, edit_loss, edit_bye, edit_wo,
+                              edit_rounds_count, edit_cups_count, edit_qualifiers_count, edit_cup_size, t["id"]))
                         st.success("Configuración guardada.")
                         st.rerun()
 
@@ -1797,8 +2875,9 @@ elif choice == "Torneos":
                             st.rerun()
 
                 b1, b2 = st.columns(2)
+                st.caption("Para búsquedas largas usá Panel Admin → Motor Chess.com, que guarda progreso separado.")
                 if b1.button("Buscar resultados Chess.com", key=f"scan_{t['id']}"):
-                    found, debug = scan_tournament(t["id"])
+                    found, debug = safe_scan_tournament(t["id"])
                     st.success(f"Detectadas: {found}")
                     st.dataframe(debug, use_container_width=True)
 
@@ -1812,7 +2891,7 @@ elif choice == "Torneos":
                     auto = st.checkbox("Detectar automáticamente cada 1 minuto", key=f"auto_{t['id']}")
                     if auto:
                         st.markdown('<meta http-equiv="refresh" content="60">', unsafe_allow_html=True)
-                        found, debug = scan_tournament(t["id"])
+                        found, debug = safe_scan_tournament(t["id"])
                         st.caption(f"Auto-búsqueda ejecutada. Detectadas: {found}")
                         st.dataframe(debug, use_container_width=True)
 
@@ -1881,6 +2960,19 @@ elif choice == "Torneos":
                             except Exception as exc:
                                 st.error(exc)
 
+            st.subheader("Vista de ronda")
+            rounds_for_view = q("SELECT number,start_datetime,end_datetime,status FROM rounds WHERE tournament_id=? ORDER BY number", (t["id"],))
+            if rounds_for_view:
+                round_options = [int(r["number"]) for r in rounds_for_view]
+                selected_round = st.selectbox("Seleccionar ronda", round_options, key=f"view_round_{t['id']}")
+                visual_rows = round_visual_rows(t["id"], selected_round)
+                st.dataframe(visual_rows, use_container_width=True, hide_index=True)
+            else:
+                st.info("Este torneo todavía no tiene rondas.")
+
+            st.subheader("Playoffs / Copas")
+            render_playoff_bracket(t["id"])
+
             st.subheader("Rondas")
             rounds = q("SELECT number,start_datetime,end_datetime,status FROM rounds WHERE tournament_id=? ORDER BY number", (t["id"],))
             st.dataframe(rounds, use_container_width=True)
@@ -1911,7 +3003,7 @@ elif choice == "Torneos":
             st.subheader("Tabla")
             st.dataframe(standings(t["id"]), use_container_width=True)
 
-elif choice == "Admin usuarios":
+elif admin_choice == "Admin usuarios":
     st.header("Admin usuarios")
     users = q("SELECT * FROM users ORDER BY role DESC, display_name")
     st.dataframe([{
