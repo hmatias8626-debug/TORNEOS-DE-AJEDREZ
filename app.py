@@ -35,14 +35,21 @@ def use_postgres():
 
 def pg_conn():
     import psycopg2
-    return psycopg2.connect(
+    cached = st.session_state.get("_pg_conn")
+    if cached is not None and cached.closed == 0:
+        return cached
+    c = psycopg2.connect(
         host=st.secrets["DB_HOST"],
         port=int(st.secrets["DB_PORT"]),
         dbname=st.secrets["DB_NAME"],
         user=st.secrets["DB_USER"],
         password=st.secrets["DB_PASSWORD"],
         sslmode="require",
+        connect_timeout=10,
     )
+    c.autocommit = True
+    st.session_state["_pg_conn"] = c
+    return c
 
 
 def sqlite_conn():
@@ -70,37 +77,50 @@ def rows_to_dicts(cursor, rows):
 
 
 def q(sql, params=(), one=False):
-    c = conn()
-    cur = c.cursor()
-    cur.execute(adapt_sql(sql), params)
-    rows = cur.fetchall()
-    out = rows_to_dicts(cur, rows)
-    c.close()
-    if one:
-        return out[0] if out else None
-    return out
+    for attempt in range(2):
+        try:
+            c = conn()
+            cur = c.cursor()
+            cur.execute(adapt_sql(sql), params)
+            rows = cur.fetchall()
+            out = rows_to_dicts(cur, rows)
+            if not use_postgres():
+                c.close()
+            if one:
+                return out[0] if out else None
+            return out
+        except Exception:
+            if use_postgres() and attempt == 0:
+                st.session_state.pop("_pg_conn", None)
+            else:
+                raise
 
 
 def exec_sql(sql, params=()):
-    c = conn()
-    cur = c.cursor()
-    cur.execute(adapt_sql(sql), params)
-    last_id = None
-
-    if use_postgres():
+    for attempt in range(2):
         try:
-            if cur.description:
-                row = cur.fetchone()
-                if row:
-                    last_id = row[0]
-        except Exception:
+            c = conn()
+            cur = c.cursor()
+            cur.execute(adapt_sql(sql), params)
             last_id = None
-    else:
-        last_id = cur.lastrowid
-
-    c.commit()
-    c.close()
-    return last_id
+            if use_postgres():
+                try:
+                    if cur.description:
+                        row = cur.fetchone()
+                        if row:
+                            last_id = row[0]
+                except Exception:
+                    last_id = None
+            else:
+                last_id = cur.lastrowid
+                c.commit()
+                c.close()
+            return last_id
+        except Exception:
+            if use_postgres() and attempt == 0:
+                st.session_state.pop("_pg_conn", None)
+            else:
+                raise
 
 
 def db_now_default():
