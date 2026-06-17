@@ -1,6 +1,7 @@
 import datetime as dt
 import hashlib
 import io
+import logging
 import os
 from pathlib import Path
 
@@ -8,11 +9,14 @@ import pandas as pd
 import requests
 import streamlit as st
 
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
 
 APP_TITLE = "Torneos de Ajedrez"
 DEFAULT_PASSWORD = "12345"
 API_BASE = "https://api.chess.com/pub"
-HEADERS = {"User-Agent": "torneos-ajedrez-v10-3-test-reglamento/1.0"}
+HEADERS = {"User-Agent": "torneos-ajedrez/1.0 (hmatias8626@gmail.com)"}
 SQLITE_PATH = Path("torneos_ajedrez_local.db")
 
 
@@ -572,8 +576,9 @@ def chess_profile(username):
         r = requests.get(f"{API_BASE}/player/{norm(username)}", headers=HEADERS, timeout=20)
         if r.status_code == 200:
             return r.json()
-    except Exception:
-        return None
+        logger.warning("chess_profile(%s): HTTP %s", username, r.status_code)
+    except Exception as e:
+        logger.exception("chess_profile(%s): %s", username, e)
     return None
 
 
@@ -593,8 +598,9 @@ def chess_archives(username):
         r = requests.get(f"{API_BASE}/player/{norm(username)}/games/archives", headers=HEADERS, timeout=20)
         if r.status_code == 200:
             return r.json().get("archives", [])
-    except Exception:
-        pass
+        logger.warning("chess_archives(%s): HTTP %s", username, r.status_code)
+    except Exception as e:
+        logger.exception("chess_archives(%s): %s", username, e)
     return []
 
 
@@ -619,8 +625,10 @@ def chess_games_between(username, start_dt, end_dt):
                 r = requests.get(url, headers=HEADERS, timeout=20)
                 if r.status_code == 200:
                     games.extend(r.json().get("games", []))
-            except Exception:
-                pass
+                else:
+                    logger.warning("chess_games_between(%s): HTTP %s en %s", username, r.status_code, url)
+            except Exception as e:
+                logger.exception("chess_games_between(%s): %s", username, e)
     return games
 
 
