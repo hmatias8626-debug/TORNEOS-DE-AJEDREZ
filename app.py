@@ -12,7 +12,7 @@ import streamlit as st
 APP_TITLE = "Torneos de Ajedrez"
 DEFAULT_PASSWORD = "12345"
 API_BASE = "https://api.chess.com/pub"
-HEADERS = {"User-Agent": "torneos-ajedrez-v10-3-test-reglamento/1.0"}
+HEADERS = {"User-Agent": "torneos-ajedrez/1.0 (hmatias8626@gmail.com)"}
 SQLITE_PATH = Path("torneos_ajedrez_local.db")
 ARG_TZ = dt.timezone(dt.timedelta(hours=-3))
 
