@@ -665,18 +665,33 @@ def month_keys_between(start_dt, end_dt):
     return keys
 
 
+@st.cache_data(ttl=120)
+def chess_games_month(url):
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=20)
+        if r.status_code == 200:
+            return r.json().get("games", [])
+    except Exception:
+        pass
+    return []
+
+
 def chess_games_between(username, start_dt, end_dt):
     games = []
     keys = month_keys_between(start_dt, end_dt)
     for url in chess_archives(username):
         if any(k in url for k in keys):
-            try:
-                r = requests.get(url, headers=HEADERS, timeout=20)
-                if r.status_code == 200:
-                    games.extend(r.json().get("games", []))
-            except Exception:
-                pass
+            games.extend(chess_games_month(url))
     return games
+
+
+def prefetch_player_games(usernames, start_dt, end_dt):
+    from concurrent.futures import ThreadPoolExecutor
+    valid = [norm(u) for u in usernames if valid_chess_username(u)]
+    def _fetch(u):
+        chess_games_between(u, start_dt, end_dt)
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        list(ex.map(_fetch, valid))
 
 
 def parse_ts(timestamp):
@@ -1186,6 +1201,18 @@ def scan_tournament(tournament_id):
         LEFT JOIN users bu ON bu.id=m.black_user_id
         WHERE m.tournament_id=? AND m.status='pending' AND m.locked=0
     """, (tournament_id,))
+
+    if pending:
+        first = pending[0]
+        start_dt_pre = parse_db_datetime(first["start_datetime"])
+        end_dt_pre   = parse_db_datetime(first["end_datetime"])
+        all_usernames = set()
+        for m in pending:
+            if m["white_chess"]:
+                all_usernames.add(m["white_chess"])
+            if m["black_chess"]:
+                all_usernames.add(m["black_chess"])
+        prefetch_player_games(all_usernames, start_dt_pre, end_dt_pre)
 
     found = 0
     debug = []
