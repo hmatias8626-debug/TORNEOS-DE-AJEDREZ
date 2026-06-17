@@ -88,6 +88,13 @@ def rows_to_dicts(cursor, rows):
     return [dict(row) for row in rows]
 
 
+def _clear_pg_cache():
+    try:
+        st.session_state.pop("_pg_conn", None)
+    except Exception:
+        pass
+
+
 def q(sql, params=(), one=False):
     for attempt in range(2):
         try:
@@ -103,7 +110,7 @@ def q(sql, params=(), one=False):
             return out
         except Exception:
             if use_postgres() and attempt == 0:
-                st.session_state.pop("_pg_conn", None)
+                _clear_pg_cache()
             else:
                 raise
 
@@ -130,7 +137,7 @@ def exec_sql(sql, params=()):
             return last_id
         except Exception:
             if use_postgres() and attempt == 0:
-                st.session_state.pop("_pg_conn", None)
+                _clear_pg_cache()
             else:
                 raise
 
@@ -705,7 +712,7 @@ def prefetch_player_games(usernames, start_dt, end_dt):
     valid = [norm(u) for u in usernames if valid_chess_username(u)]
     def _fetch(u):
         chess_games_between(u, start_dt, end_dt)
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=3) as ex:
         list(ex.map(_fetch, valid))
 
 
@@ -2181,6 +2188,12 @@ def pending_matches_for_scan(tournament_id, round_number=None):
 def scan_single_match_for_job(tournament, match):
     start_dt = parse_db_datetime(match["start_datetime"])
     end_dt = parse_db_datetime(match["end_datetime"])
+
+    white_exists = chess_user_exists(match["white_chess"])
+    black_exists = chess_user_exists(match["black_chess"])
+    if not white_exists or not black_exists:
+        missing = [u for u, ok in [(match["white_chess"], white_exists), (match["black_chess"], black_exists)] if not ok]
+        return "pendiente", "usuario inexistente en Chess.com: " + ", ".join(missing), ""
 
     games = chess_games_between(match["white_chess"], start_dt, end_dt)
     games += chess_games_between(match["black_chess"], start_dt, end_dt)
