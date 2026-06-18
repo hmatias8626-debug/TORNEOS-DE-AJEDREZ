@@ -3237,39 +3237,61 @@ elif admin_choice == "Admin usuarios":
         try:
             df_jug = pd.read_excel(cel_file, sheet_name="jugadores", header=0)
             df_jug.columns = [str(c).strip() for c in df_jug.columns]
-            col_usuario = df_jug.columns[2]
-            col_celular = df_jug.columns[4]
-            df_jug = df_jug[[col_usuario, col_celular]].dropna(subset=[col_usuario])
+            col_nombre   = df_jug.columns[1]
+            col_usuario  = df_jug.columns[2]
+            col_celular  = df_jug.columns[4]
             df_jug[col_celular] = df_jug[col_celular].apply(
                 lambda v: "".join(c for c in str(v) if c.isdigit()) if pd.notna(v) else ""
             )
             df_jug = df_jug[df_jug[col_celular].str.len() >= 8]
 
             all_users = q("SELECT id, display_name, chesscom_user, celular FROM users")
-            user_map = {(u["chesscom_user"] or "").lower(): u for u in all_users}
+            # mapa 1: por chesscom_user
+            by_chess = {(u["chesscom_user"] or "").lower(): u for u in all_users if u["chesscom_user"]}
+            # mapa 2: por alias  {alias_lower: user_id}
+            all_aliases = q("SELECT user_id, alias FROM chess_aliases")
+            alias_to_uid = {(a["alias"] or "").lower(): a["user_id"] for a in all_aliases}
+            uid_map = {u["id"]: u for u in all_users}
+            # mapa 3: por display_name
+            by_display = {(u["display_name"] or "").lower(): u for u in all_users if u["display_name"]}
+
+            def find_user(username_raw, nombre_raw):
+                key = username_raw.lower()
+                if key and key in by_chess:
+                    return by_chess[key], "usuario"
+                if key and key in alias_to_uid:
+                    return uid_map[alias_to_uid[key]], "alias"
+                # fallback: nombre del Excel contra display_name
+                nkey = nombre_raw.lower()
+                if nkey and nkey in by_display:
+                    return by_display[nkey], "nombre"
+                return None, None
 
             preview = []
             updates = []
             for _, row in df_jug.iterrows():
-                username_raw = str(row[col_usuario]).strip()
-                celular_raw = str(row[col_celular]).strip()
-                u = user_map.get(username_raw.lower())
+                username_raw = str(row[col_usuario]).strip() if pd.notna(row[col_usuario]) else ""
+                nombre_raw   = str(row[col_nombre]).strip()  if pd.notna(row[col_nombre])  else ""
+                celular_raw  = str(row[col_celular]).strip()
+                u, via = find_user(username_raw, nombre_raw)
                 if u:
                     preview.append({
                         "Chess.com": u["chesscom_user"],
                         "Nombre": u["display_name"],
                         "Celular actual": u.get("celular") or "—",
                         "Celular nuevo": celular_raw,
+                        "Via": via,
                         "Acción": "actualizar" if (u.get("celular") or "") != celular_raw else "sin cambio",
                     })
                     if (u.get("celular") or "") != celular_raw:
                         updates.append((celular_raw, u["id"]))
                 else:
                     preview.append({
-                        "Chess.com": username_raw,
-                        "Nombre": "—",
+                        "Chess.com": username_raw or nombre_raw,
+                        "Nombre": nombre_raw,
                         "Celular actual": "—",
                         "Celular nuevo": celular_raw,
+                        "Via": "—",
                         "Acción": "⚠️ no encontrado",
                     })
 
