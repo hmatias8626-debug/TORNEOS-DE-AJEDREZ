@@ -616,19 +616,24 @@ def month_keys_between(start_dt, end_dt):
     return keys
 
 
+@st.cache_data(ttl=120)
+def chess_games_month(url):
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=20)
+        if r.status_code == 200:
+            return r.json().get("games", [])
+        logger.warning("chess_games_month(%s): HTTP %s", url, r.status_code)
+    except Exception as e:
+        logger.exception("chess_games_month(%s): %s", url, e)
+    return []
+
+
 def chess_games_between(username, start_dt, end_dt):
     games = []
     keys = month_keys_between(start_dt, end_dt)
     for url in chess_archives(username):
         if any(k in url for k in keys):
-            try:
-                r = requests.get(url, headers=HEADERS, timeout=20)
-                if r.status_code == 200:
-                    games.extend(r.json().get("games", []))
-                else:
-                    logger.warning("chess_games_between(%s): HTTP %s en %s", username, r.status_code, url)
-            except Exception as e:
-                logger.exception("chess_games_between(%s): %s", username, e)
+            games.extend(chess_games_month(url))
     return games
 
 
