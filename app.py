@@ -1971,6 +1971,15 @@ def scan_single_match_for_job(tournament, match):
     return "pendiente", final_reason, ""
 
 
+def prefetch_player_games(usernames, start_dt, end_dt):
+    from concurrent.futures import ThreadPoolExecutor
+    valid = [norm(u) for u in usernames if valid_chess_username(u)]
+    def _fetch(u):
+        chess_games_between(u, start_dt, end_dt)
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        list(ex.map(_fetch, valid))
+
+
 def run_scan_job(tournament_id, round_number, admin_user_id, progress_placeholder=None):
     tournament = q("SELECT * FROM tournaments WHERE id=?", (tournament_id,), one=True)
     if not tournament:
@@ -1983,6 +1992,26 @@ def run_scan_job(tournament_id, round_number, admin_user_id, progress_placeholde
         update_scan_job_counts(job_id)
         finish_scan_job(job_id)
         return job_id
+
+    # Pre-cargar todos los jugadores en paralelo antes del loop
+    all_users = set()
+    min_start = None
+    max_end = None
+    for m in matches:
+        if m["white_chess"]:
+            all_users.add(m["white_chess"])
+        if m["black_chess"]:
+            all_users.add(m["black_chess"])
+        s = parse_db_datetime(m["start_datetime"])
+        e = parse_db_datetime(m["end_datetime"])
+        if min_start is None or s < min_start:
+            min_start = s
+        if max_end is None or e > max_end:
+            max_end = e
+
+    if progress_placeholder is not None:
+        progress_placeholder.info(f"Pre-cargando partidas de {len(all_users)} jugadores en Chess.com...")
+    prefetch_player_games(all_users, min_start, max_end)
 
     job_id = create_scan_job(tournament_id, round_number, admin_user_id, len(matches))
 
