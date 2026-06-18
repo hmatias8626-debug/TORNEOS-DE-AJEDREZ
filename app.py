@@ -1924,6 +1924,18 @@ def pending_matches_for_scan(tournament_id, round_number=None):
     """, tuple(params))
 
 
+def _user_chess_names(user_id):
+    """Devuelve el set de usernames de Chess.com de un usuario (principal + aliases)."""
+    user = get_user(user_id)
+    names = set()
+    if user and user.get("chesscom_user"):
+        names.add(norm(user["chesscom_user"]))
+    aliases = q("SELECT alias FROM chess_aliases WHERE user_id=?", (user_id,))
+    for a in aliases:
+        names.add(norm(a["alias"]))
+    return names
+
+
 def scan_single_match_for_job(tournament, match):
     start_dt = parse_db_datetime(match["start_datetime"])
     end_dt = parse_db_datetime(match["end_datetime"])
@@ -1938,6 +1950,10 @@ def scan_single_match_for_job(tournament, match):
         if not black_exists:
             missing.append(match["black_chess"])
         return "error", "usuario inexistente en Chess.com: " + ", ".join(missing), ""
+
+    # Precargar aliases una sola vez — evita N queries a Supabase por cada partida analizada
+    white_names = _user_chess_names(match["white_user_id"])
+    black_names = _user_chess_names(match["black_user_id"])
 
     games = chess_games_between(match["white_chess"], start_dt, end_dt)
     games += chess_games_between(match["black_chess"], start_dt, end_dt)
@@ -1960,14 +1976,16 @@ def scan_single_match_for_job(tournament, match):
             found_players_game = True
             continue
 
-        exact, inverted = game_is_between_players_any_color(game, match["white_user_id"], match["black_user_id"])
+        actual_white = norm(game.get("white", {}).get("username"))
+        actual_black = norm(game.get("black", {}).get("username"))
+        exact    = actual_white in white_names and actual_black in black_names
+        inverted = actual_white in black_names and actual_black in white_names
+
         if not exact and not inverted:
-            # No sobreescribir si ya encontramos una partida de estos jugadores
             if not found_players_game:
                 final_reason = "sin partidas de los jugadores en el rango"
             continue
 
-        # A partir de acá la partida es entre los jugadores correctos
         found_players_game = True
 
         ok, reason = validate_game_without_color(game, tournament, start_dt, end_dt)
@@ -1975,11 +1993,15 @@ def scan_single_match_for_job(tournament, match):
             final_reason = reason
             continue
 
-        score = score_for_fixture_white(game, match["white_user_id"], match["black_user_id"])
-        if score is None:
+        # Calcular score usando los sets precargados (sin DB)
+        actual_score_white = score_for_white(game)
+        if actual_score_white is None:
             final_reason = "partida encontrada sin resultado interpretable"
             continue
 
+        score = actual_score_white if actual_white in white_names else (
+            1.0 - actual_score_white if actual_score_white != 0.5 else 0.5
+        )
         result = result_label(score)
 
         if exact:
