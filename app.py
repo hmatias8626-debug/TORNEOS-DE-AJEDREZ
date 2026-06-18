@@ -509,6 +509,7 @@ def ensure_v9_columns():
         ("tournaments", "cups_count", "INTEGER DEFAULT 3"),
         ("tournaments", "qualifiers_count", "INTEGER DEFAULT 24"),
         ("tournaments", "cup_size", "INTEGER DEFAULT 8"),
+        ("users", "celular", "TEXT"),
     ]
     for table, col, definition in cols:
         ensure_column_runtime(table, col, definition)
@@ -2795,141 +2796,68 @@ elif admin_choice == "Torneos Admin":
     tournaments = q("SELECT * FROM tournaments ORDER BY id DESC")
     if not tournaments:
         st.info("Todavía no hay torneos.")
+    else:
+        STATUS_BADGE = {"playing": "🟢 Jugando", "open": "🟡 Abierto", "finished": "⚫ Finalizado"}
 
-    for t in tournaments:
-        with st.expander(f"{t['name']} — {t['status']} — {t['time_class']} — {t['time_control']}", expanded=True):
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Ritmo", t["time_control"])
-            c2.metric("Clase", t["time_class"])
-            c3.metric("Modalidad", t["rules"])
-            c4.metric("Colores", "Exactos" if t["strict_colors"] else "Flexibles")
+        t_labels = {f"{t['name']}  —  {STATUS_BADGE.get(t['status'], t['status'])}": t for t in tournaments}
+        sel_label = st.selectbox("Seleccionar torneo", list(t_labels.keys()))
+        t = t_labels[sel_label]
 
-            if is_staff(current_user):
-                with st.expander("Modificar torneo"):
-                    ec1, ec2, ec3 = st.columns(3)
-                    new_time = ec1.text_input("Ritmo regular", value=str(t["time_control"]), key=f"time_{t['id']}")
-                    new_class = ec2.selectbox("Clase regular", ["rapid", "blitz", "bullet", "daily"], index=["rapid", "blitz", "bullet", "daily"].index(t["time_class"]) if t["time_class"] in ["rapid", "blitz", "bullet", "daily"] else 0, key=f"class_{t['id']}")
-                    strict = ec3.checkbox("Colores exactos", value=bool(t["strict_colors"]), key=f"strict_{t['id']}")
+        badge = STATUS_BADGE.get(t["status"], t["status"])
+        st.markdown(f"**{t['name']}** &nbsp; {badge} &nbsp;·&nbsp; {t['time_class']} &nbsp;·&nbsp; {t['time_control']}")
 
-                    pc1, pc2 = st.columns(2)
-                    playoff_time = pc1.text_input("Ritmo playoffs", value=str(t["playoff_time_control"]), key=f"ptime_{t['id']}")
-                    playoff_class = pc2.selectbox("Clase playoffs", ["rapid", "blitz", "bullet", "daily"], index=["rapid", "blitz", "bullet", "daily"].index(t["playoff_time_class"]) if t["playoff_time_class"] in ["rapid", "blitz", "bullet", "daily"] else 1, key=f"pclass_{t['id']}")
+        review_count = len(q("SELECT id FROM matches WHERE tournament_id=? AND status='review'", (t["id"],)))
+        gestión_label = f"🎯 Gestión  ({review_count})" if review_count > 0 else "🎯 Gestión"
 
-                    st.markdown("**Estructura**")
-                    es1, es2, es3, es4 = st.columns(4)
-                    edit_rounds_count = es1.number_input("Rondas", value=int(t.get("rounds_count", 0) or 0), min_value=0, step=1, key=f"rounds_count_{t['id']}")
-                    edit_cups_count = es2.number_input("Copas", value=int(t.get("cups_count", 3) or 3), min_value=1, step=1, key=f"cups_count_{t['id']}")
-                    edit_qualifiers_count = es3.number_input("Clasificados", value=int(t.get("qualifiers_count", 24) or 24), min_value=2, step=1, key=f"qualifiers_count_{t['id']}")
-                    edit_cup_size = es4.number_input("Por copa", value=int(t.get("cup_size", 8) or 8), min_value=2, step=2, key=f"cup_size_{t['id']}")
+        tab_res, tab_gest, tab_cruces, tab_playoffs, tab_cfg = st.tabs([
+            "📊 Resumen", gestión_label, "📋 Cruces", "🏆 Playoffs", "⚙️ Config"
+        ])
 
-                    st.markdown("**Sistema de puntos**")
-                    pp1, pp2, pp3, pp4, pp5 = st.columns(5)
-                    edit_win = pp1.number_input("Victoria", value=float(t.get("win_points", 1) or 1), step=0.5, key=f"win_{t['id']}")
-                    edit_draw = pp2.number_input("Empate", value=float(t.get("draw_points", 0.5) or 0.5), step=0.5, key=f"draw_{t['id']}")
-                    edit_loss = pp3.number_input("Derrota", value=float(t.get("loss_points", 0) or 0), step=0.5, key=f"loss_{t['id']}")
-                    edit_bye = pp4.number_input("BYE/libre", value=float(t.get("bye_points", 1) or 1), step=0.5, key=f"bye_{t['id']}")
-                    edit_wo = pp5.number_input("WO", value=float(t.get("wo_points", 0) or 0), step=0.5, key=f"wo_pts_{t['id']}")
+        # ── TAB RESUMEN ──────────────────────────────────────────────
+        with tab_res:
+            kpis = tournament_kpis(t["id"])
+            mc1, mc2, mc3, mc4, mc5 = st.columns(5)
+            mc1.metric("Jugadores", kpis["Jugadores"])
+            mc2.metric("Total cruces", kpis["Cruces"])
+            mc3.metric("Finalizadas", kpis["Finalizadas"])
+            mc4.metric("Pendientes", kpis["Pendientes"])
+            mc5.metric("Revisión", kpis["Revisión"])
 
-                    if st.button("Guardar configuración", key=f"save_t_{t['id']}"):
-                        exec_sql("""
-                            UPDATE tournaments
-                            SET time_control=?, time_class=?, strict_colors=?, playoff_time_control=?, playoff_time_class=?,
-                                win_points=?, draw_points=?, loss_points=?, bye_points=?, wo_points=?,
-                                rounds_count=?, cups_count=?, qualifiers_count=?, cup_size=?
-                            WHERE id=?
-                        """, (new_time, new_class, 1 if strict else 0, playoff_time, playoff_class,
-                              edit_win, edit_draw, edit_loss, edit_bye, edit_wo,
-                              edit_rounds_count, edit_cups_count, edit_qualifiers_count, edit_cup_size, t["id"]))
-                        st.success("Configuración guardada.")
-                        st.rerun()
+            if review_count:
+                st.warning(f"⚠️ {review_count} partida(s) esperan revisión de colores — ver tab Gestión.")
 
-                with st.expander("Editar fechas de rondas"):
-                    rounds = q("SELECT * FROM rounds WHERE tournament_id=? ORDER BY number", (t["id"],))
-                    for r in rounds:
-                        st.write(f"**Ronda {r['number']}**")
-                        start_dt = parse_db_datetime(r["start_datetime"])
-                        end_dt = parse_db_datetime(r["end_datetime"])
-                        cfi, cff = st.columns(2)
-                        new_start = cfi.text_input("Inicio", value=start_dt.strftime("%d/%m/%Y %H:%M"), key=f"rs_{r['id']}")
-                        new_end = cff.text_input("Fin", value=end_dt.strftime("%d/%m/%Y %H:%M"), key=f"re_{r['id']}")
-                        if st.button("Guardar fechas", key=f"save_round_{r['id']}"):
-                            parsed_start = pd.to_datetime(new_start, dayfirst=True).to_pydatetime()
-                            parsed_end = pd.to_datetime(new_end, dayfirst=True).to_pydatetime()
-                            exec_sql("UPDATE rounds SET start_datetime=?, end_datetime=? WHERE id=?", (parsed_start, parsed_end, r["id"]))
-                            st.success("Fechas actualizadas.")
-                            st.rerun()
+            st.divider()
+            rb1, rb2 = st.columns(2)
+            if rb1.button("🔍 Buscar resultados Chess.com", key=f"scan_res_{t['id']}"):
+                found, debug = safe_scan_tournament(t["id"])
+                st.success(f"Detectadas: {found}")
+                st.dataframe(debug, use_container_width=True)
+            if rb2.button("⏱ Aplicar WO vencidos", key=f"wo_res_{t['id']}"):
+                applied = apply_wo_expired(t["id"])
+                st.warning(f"WO aplicados: {applied}")
+                st.rerun()
 
-                b1, b2 = st.columns(2)
-                st.caption("Para búsquedas largas usá Panel Admin → Motor Chess.com, que guarda progreso separado.")
-                if b1.button("Buscar resultados Chess.com", key=f"scan_{t['id']}"):
-                    found, debug = safe_scan_tournament(t["id"])
-                    st.success(f"Detectadas: {found}")
-                    st.dataframe(debug, use_container_width=True)
-
-                if b2.button("Aplicar WO vencidos", key=f"wo_{t['id']}"):
-                    applied = apply_wo_expired(t["id"])
-                    st.warning(f"WO aplicados: {applied}")
+            st.divider()
+            if t["status"] != "finished":
+                confirm_end = st.checkbox("Confirmar que quiero finalizar este torneo", key=f"confirm_end_{t['id']}")
+                if st.button("🏁 Finalizar torneo", key=f"finish_end_{t['id']}", disabled=not confirm_end, type="primary"):
+                    exec_sql("UPDATE tournaments SET status='finished' WHERE id=?", (t["id"],))
+                    audit(current_user["id"], "finish_tournament", f"tournament={t['id']}")
+                    st.success("Torneo finalizado.")
+                    st.rerun()
+            else:
+                st.success("✅ Este torneo está finalizado.")
+                if st.button("↩ Reabrir torneo (volver a 'playing')", key=f"reopen_end_{t['id']}"):
+                    exec_sql("UPDATE tournaments SET status='playing' WHERE id=?", (t["id"],))
+                    audit(current_user["id"], "reopen_tournament", f"tournament={t['id']}")
+                    st.warning("Torneo reabierto.")
                     st.rerun()
 
-                st.divider()
-                if t["status"] != "finished":
-                    confirm_finish = st.checkbox(
-                        "Confirmar que quiero finalizar este torneo",
-                        key=f"confirm_finish_{t['id']}",
-                    )
-                    if st.button("🏁 Finalizar torneo", key=f"finish_{t['id']}", disabled=not confirm_finish, type="primary"):
-                        exec_sql("UPDATE tournaments SET status='finished' WHERE id=?", (t["id"],))
-                        audit(current_user["id"], "finish_tournament", f"tournament={t['id']}")
-                        st.success("Torneo finalizado.")
-                        st.rerun()
-                else:
-                    st.success("✅ Este torneo está finalizado.")
-                    if st.button("↩ Reabrir torneo (volver a 'playing')", key=f"reopen_{t['id']}"):
-                        exec_sql("UPDATE tournaments SET status='playing' WHERE id=?", (t["id"],))
-                        audit(current_user["id"], "reopen_tournament", f"tournament={t['id']}")
-                        st.warning("Torneo reabierto.")
-                        st.rerun()
-
-                # Auto scan simple: refresh vía meta cada minuto si se activa
-                with st.expander("Motor automático y resultados manuales"):
-                    auto = st.checkbox("Detectar automáticamente cada 1 minuto", key=f"auto_{t['id']}")
-                    if auto:
-                        st.markdown('<meta http-equiv="refresh" content="60">', unsafe_allow_html=True)
-                        found, debug = safe_scan_tournament(t["id"])
-                        st.caption(f"Auto-búsqueda ejecutada. Detectadas: {found}")
-                        st.dataframe(debug, use_container_width=True)
-
-                    all_matches = q("""
-                        SELECT m.*, r.number,
-                               wu.chesscom_user AS white_chess,
-                               bu.chesscom_user AS black_chess
-                        FROM matches m
-                        JOIN rounds r ON r.id=m.round_id
-                        JOIN users wu ON wu.id=m.white_user_id
-                        LEFT JOIN users bu ON bu.id=m.black_user_id
-                        WHERE m.tournament_id=?
-                        ORDER BY r.number, m.id
-                    """, (t["id"],))
-                    if all_matches:
-                        labels = {f"R{m['number']} | {m['white_chess']} vs {m['black_chess'] or 'LIBRE/BYE'} | {m['status']} | {m['result'] or 'sin resultado'}": m["id"] for m in all_matches}
-                        sel = st.selectbox("Partida", list(labels.keys()), key=f"manual_match_{t['id']}")
-                        res = st.selectbox("Resultado", ["1-0", "0-1", "1/2-1/2"], key=f"manual_res_{t['id']}")
-                        cm1, cm2 = st.columns(2)
-                        if cm1.button("Guardar resultado manual", key=f"save_manual_{t['id']}"):
-                            try:
-                                set_manual_result(labels[sel], res, current_user["id"])
-                                st.success("Resultado manual guardado.")
-                                st.rerun()
-                            except Exception as exc:
-                                st.error(exc)
-                        if cm2.button("Limpiar resultado", key=f"clear_manual_{t['id']}"):
-                            try:
-                                clear_match_result(labels[sel], current_user["id"])
-                                st.warning("Resultado limpiado.")
-                                st.rerun()
-                            except Exception as exc:
-                                st.error(exc)
-
+        # ── TAB GESTIÓN ───────────────────────────────────────────────
+        with tab_gest:
+            if review_count:
+                st.subheader(f"⚠️ Revisiones por colores invertidos ({review_count})")
+                st.warning("Estas partidas coinciden pero se jugaron con colores invertidos.")
                 reviews = q("""
                     SELECT m.*, r.number,
                            wu.chesscom_user AS white_chess,
@@ -2941,48 +2869,49 @@ elif admin_choice == "Torneos Admin":
                     WHERE m.tournament_id=? AND m.status='review'
                     ORDER BY r.number, m.id
                 """, (t["id"],))
-                if reviews:
-                    st.subheader("Revisión por colores invertidos")
-                    st.warning("Estas partidas coinciden, pero se jugaron con colores invertidos.")
-                    for rm in reviews:
-                        st.write(f"R{rm['number']} | `{rm['white_chess']} vs {rm['black_chess']}` | Resultado si acepta: **{rm['review_result'] or rm['result']}**")
-                        if rm["review_url"]:
-                            st.write(rm["review_url"])
-                        ca, cr = st.columns(2)
-                        if ca.button("Aceptar partida", key=f"accept_{rm['id']}"):
-                            try:
-                                accept_color_review(rm["id"], current_user["id"])
-                                st.success("Aceptada.")
-                                st.rerun()
-                            except Exception as exc:
-                                st.error(exc)
-                        if cr.button("Rechazar partida", key=f"reject_{rm['id']}"):
-                            try:
-                                reject_color_review(rm["id"], current_user["id"])
-                                st.warning("Rechazada.")
-                                st.rerun()
-                            except Exception as exc:
-                                st.error(exc)
+                for rm in reviews:
+                    st.write(f"R{rm['number']} | `{rm['white_chess']} vs {rm['black_chess']}` | Resultado si acepta: **{rm['review_result'] or rm['result']}**")
+                    if rm["review_url"]:
+                        st.write(rm["review_url"])
+                    rca, rcr = st.columns(2)
+                    if rca.button("✅ Aceptar partida", key=f"accept_{rm['id']}"):
+                        try:
+                            accept_color_review(rm["id"], current_user["id"])
+                            st.success("Aceptada.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(exc)
+                    if rcr.button("❌ Rechazar partida", key=f"reject_{rm['id']}"):
+                        try:
+                            reject_color_review(rm["id"], current_user["id"])
+                            st.warning("Rechazada.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(exc)
+                st.divider()
 
-            st.subheader("Vista de ronda")
-            rounds_for_view = q("SELECT number,start_datetime,end_datetime,status FROM rounds WHERE tournament_id=? ORDER BY number", (t["id"],))
-            if rounds_for_view:
-                round_options = [int(r["number"]) for r in rounds_for_view]
-                selected_round = st.selectbox("Seleccionar ronda", round_options, key=f"view_round_{t['id']}")
-                visual_rows = round_visual_rows(t["id"], selected_round)
-                st.dataframe(visual_rows, use_container_width=True, hide_index=True)
-            else:
-                st.info("Este torneo todavía no tiene rondas.")
+            st.subheader("Motor Chess.com")
+            st.caption("Para búsquedas largas usá Panel Admin → Motor Chess.com, que guarda progreso separado.")
+            gb1, gb2 = st.columns(2)
+            if gb1.button("🔍 Buscar resultados Chess.com", key=f"scan_g_{t['id']}"):
+                found, debug = safe_scan_tournament(t["id"])
+                st.success(f"Detectadas: {found}")
+                st.dataframe(debug, use_container_width=True)
+            if gb2.button("⏱ Aplicar WO vencidos", key=f"wo_g_{t['id']}"):
+                applied = apply_wo_expired(t["id"])
+                st.warning(f"WO aplicados: {applied}")
+                st.rerun()
 
-            st.subheader("Playoffs / Copas")
-            render_playoff_bracket(t["id"])
+            auto_g = st.checkbox("Detectar automáticamente cada 1 minuto", key=f"auto_g_{t['id']}")
+            if auto_g:
+                st.markdown('<meta http-equiv="refresh" content="60">', unsafe_allow_html=True)
+                found, debug = safe_scan_tournament(t["id"])
+                st.caption(f"Auto-búsqueda ejecutada. Detectadas: {found}")
+                st.dataframe(debug, use_container_width=True)
 
-            st.subheader("Rondas")
-            rounds = q("SELECT number,start_datetime,end_datetime,status FROM rounds WHERE tournament_id=? ORDER BY number", (t["id"],))
-            st.dataframe(rounds, use_container_width=True)
-
-            st.subheader("Cruces")
-            matches = q("""
+            st.divider()
+            st.subheader("Resultado manual")
+            all_matches_g = q("""
                 SELECT m.*, r.number,
                        wu.chesscom_user AS white_chess,
                        bu.chesscom_user AS black_chess
@@ -2993,19 +2922,129 @@ elif admin_choice == "Torneos Admin":
                 WHERE m.tournament_id=?
                 ORDER BY r.number, m.id
             """, (t["id"],))
-            st.dataframe([{
-                "Ronda": m["number"],
-                "Blancas": m["white_chess"],
-                "Negras": m["black_chess"] or "LIBRE/BYE",
-                "Estado": m["status"],
-                "Tipo": m["result_type"],
-                "Resultado": m["result"] or "",
-                "Bloqueada": "Sí" if m["locked"] else "No",
-                "Link": m["chesscom_url"] or "",
-            } for m in matches], use_container_width=True)
+            if all_matches_g:
+                match_labels = {f"R{m['number']} | {m['white_chess']} vs {m['black_chess'] or 'LIBRE/BYE'} | {m['status']} | {m['result'] or 'sin resultado'}": m["id"] for m in all_matches_g}
+                sel_m = st.selectbox("Partida", list(match_labels.keys()), key=f"manual_match_g_{t['id']}")
+                res_m = st.selectbox("Resultado", ["1-0", "0-1", "1/2-1/2"], key=f"manual_res_g_{t['id']}")
+                gm1, gm2 = st.columns(2)
+                if gm1.button("💾 Guardar resultado manual", key=f"save_manual_g_{t['id']}"):
+                    try:
+                        set_manual_result(match_labels[sel_m], res_m, current_user["id"])
+                        st.success("Resultado manual guardado.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(exc)
+                if gm2.button("🗑 Limpiar resultado", key=f"clear_manual_g_{t['id']}"):
+                    try:
+                        clear_match_result(match_labels[sel_m], current_user["id"])
+                        st.warning("Resultado limpiado.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(exc)
 
-            st.subheader("Tabla")
-            st.dataframe(standings(t["id"]), use_container_width=True)
+        # ── TAB CRUCES ────────────────────────────────────────────────
+        with tab_cruces:
+            rounds_for_view = q("SELECT number,start_datetime,end_datetime,status FROM rounds WHERE tournament_id=? ORDER BY number", (t["id"],))
+            if rounds_for_view:
+                round_opts = [int(r["number"]) for r in rounds_for_view]
+                sel_round = st.selectbox("Ronda", round_opts, key=f"view_round_tab_{t['id']}")
+                visual_rows = round_visual_rows(t["id"], sel_round)
+                st.dataframe(visual_rows, use_container_width=True, hide_index=True)
+            else:
+                st.info("Este torneo todavía no tiene rondas.")
+
+            with st.expander("Todos los cruces"):
+                all_cruces = q("""
+                    SELECT m.*, r.number,
+                           wu.chesscom_user AS white_chess,
+                           bu.chesscom_user AS black_chess
+                    FROM matches m
+                    JOIN rounds r ON r.id=m.round_id
+                    JOIN users wu ON wu.id=m.white_user_id
+                    LEFT JOIN users bu ON bu.id=m.black_user_id
+                    WHERE m.tournament_id=?
+                    ORDER BY r.number, m.id
+                """, (t["id"],))
+                st.dataframe([{
+                    "Ronda": m["number"],
+                    "Blancas": m["white_chess"],
+                    "Negras": m["black_chess"] or "LIBRE/BYE",
+                    "Estado": m["status"],
+                    "Tipo": m["result_type"],
+                    "Resultado": m["result"] or "",
+                    "Bloqueada": "Sí" if m["locked"] else "No",
+                    "Link": m["chesscom_url"] or "",
+                } for m in all_cruces], use_container_width=True)
+
+            with st.expander("Tabla de posiciones"):
+                st.dataframe(standings(t["id"]), use_container_width=True)
+
+        # ── TAB PLAYOFFS ──────────────────────────────────────────────
+        with tab_playoffs:
+            render_playoff_bracket(t["id"])
+
+        # ── TAB CONFIG ────────────────────────────────────────────────
+        with tab_cfg:
+            if is_staff(current_user):
+                st.subheader("Tiempos y modalidad")
+                cc1, cc2, cc3 = st.columns(3)
+                new_time = cc1.text_input("Ritmo regular", value=str(t["time_control"]), key=f"time_{t['id']}")
+                new_class = cc2.selectbox("Clase regular", ["rapid", "blitz", "bullet", "daily"],
+                    index=["rapid", "blitz", "bullet", "daily"].index(t["time_class"]) if t["time_class"] in ["rapid", "blitz", "bullet", "daily"] else 0,
+                    key=f"class_{t['id']}")
+                strict = cc3.checkbox("Colores exactos", value=bool(t["strict_colors"]), key=f"strict_{t['id']}")
+
+                cp1, cp2 = st.columns(2)
+                playoff_time = cp1.text_input("Ritmo playoffs", value=str(t["playoff_time_control"]), key=f"ptime_{t['id']}")
+                playoff_class = cp2.selectbox("Clase playoffs", ["rapid", "blitz", "bullet", "daily"],
+                    index=["rapid", "blitz", "bullet", "daily"].index(t["playoff_time_class"]) if t["playoff_time_class"] in ["rapid", "blitz", "bullet", "daily"] else 1,
+                    key=f"pclass_{t['id']}")
+
+                st.subheader("Estructura")
+                cs1, cs2, cs3, cs4 = st.columns(4)
+                edit_rounds_count = cs1.number_input("Rondas", value=int(t.get("rounds_count", 0) or 0), min_value=0, step=1, key=f"rounds_count_{t['id']}")
+                edit_cups_count = cs2.number_input("Copas", value=int(t.get("cups_count", 3) or 3), min_value=1, step=1, key=f"cups_count_{t['id']}")
+                edit_qualifiers_count = cs3.number_input("Clasificados", value=int(t.get("qualifiers_count", 24) or 24), min_value=2, step=1, key=f"qualifiers_count_{t['id']}")
+                edit_cup_size = cs4.number_input("Por copa", value=int(t.get("cup_size", 8) or 8), min_value=2, step=2, key=f"cup_size_{t['id']}")
+
+                st.subheader("Sistema de puntos")
+                sp1, sp2, sp3, sp4, sp5 = st.columns(5)
+                edit_win = sp1.number_input("Victoria", value=float(t.get("win_points", 1) or 1), step=0.5, key=f"win_{t['id']}")
+                edit_draw = sp2.number_input("Empate", value=float(t.get("draw_points", 0.5) or 0.5), step=0.5, key=f"draw_{t['id']}")
+                edit_loss = sp3.number_input("Derrota", value=float(t.get("loss_points", 0) or 0), step=0.5, key=f"loss_{t['id']}")
+                edit_bye = sp4.number_input("BYE/libre", value=float(t.get("bye_points", 1) or 1), step=0.5, key=f"bye_{t['id']}")
+                edit_wo = sp5.number_input("WO", value=float(t.get("wo_points", 0) or 0), step=0.5, key=f"wo_pts_{t['id']}")
+
+                if st.button("💾 Guardar configuración", key=f"save_t_{t['id']}"):
+                    exec_sql("""
+                        UPDATE tournaments
+                        SET time_control=?, time_class=?, strict_colors=?, playoff_time_control=?, playoff_time_class=?,
+                            win_points=?, draw_points=?, loss_points=?, bye_points=?, wo_points=?,
+                            rounds_count=?, cups_count=?, qualifiers_count=?, cup_size=?
+                        WHERE id=?
+                    """, (new_time, new_class, 1 if strict else 0, playoff_time, playoff_class,
+                          edit_win, edit_draw, edit_loss, edit_bye, edit_wo,
+                          edit_rounds_count, edit_cups_count, edit_qualifiers_count, edit_cup_size, t["id"]))
+                    st.success("Configuración guardada.")
+                    st.rerun()
+
+                st.subheader("Fechas de rondas")
+                rounds_cfg = q("SELECT * FROM rounds WHERE tournament_id=? ORDER BY number", (t["id"],))
+                for r in rounds_cfg:
+                    st.write(f"**Ronda {r['number']}**")
+                    start_dt = parse_db_datetime(r["start_datetime"])
+                    end_dt = parse_db_datetime(r["end_datetime"])
+                    rfi, rff = st.columns(2)
+                    new_start = rfi.text_input("Inicio", value=start_dt.strftime("%d/%m/%Y %H:%M"), key=f"rs_{r['id']}")
+                    new_end = rff.text_input("Fin", value=end_dt.strftime("%d/%m/%Y %H:%M"), key=f"re_{r['id']}")
+                    if st.button("Guardar fechas", key=f"save_round_{r['id']}"):
+                        parsed_start = pd.to_datetime(new_start, dayfirst=True).to_pydatetime()
+                        parsed_end = pd.to_datetime(new_end, dayfirst=True).to_pydatetime()
+                        exec_sql("UPDATE rounds SET start_datetime=?, end_datetime=? WHERE id=?", (parsed_start, parsed_end, r["id"]))
+                        st.success("Fechas actualizadas.")
+                        st.rerun()
+            else:
+                st.info("Solo los administradores pueden modificar la configuración.")
 
 elif admin_choice == "Admin usuarios":
     st.header("Admin usuarios")
@@ -3015,6 +3054,7 @@ elif admin_choice == "Admin usuarios":
         "Nombre": u["display_name"],
         "Usuario": u["username"],
         "Chess.com": u["chesscom_user"],
+        "Celular": u.get("celular") or "",
         "Rol": u["role"],
         "ELO": u["elo"],
         "Estado": u["account_status"],
@@ -3043,11 +3083,13 @@ elif admin_choice == "Admin usuarios":
 
         new_chess_name = st.text_input("Nuevo Chess.com principal", value=target_user["chesscom_user"])
         new_display = st.text_input("Nombre visible", value=target_user["display_name"])
+        new_celular = st.text_input("Celular (sin +, ej: 3815123456)", value=target_user.get("celular") or "")
         keep_alias = st.checkbox("Guardar anterior como alias", value=True)
 
         if st.button("Guardar corrección"):
             try:
                 update_user_chess(target_user["id"], new_chess_name, new_display, keep_alias)
+                exec_sql("UPDATE users SET celular=? WHERE id=?", (new_celular.strip() or None, target_user["id"]))
                 st.success("Perfil corregido.")
                 st.rerun()
             except Exception as exc:
