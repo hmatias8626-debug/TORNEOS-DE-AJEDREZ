@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 torneos_ajedrez_local.db
 .streamlit/
+.claude/
