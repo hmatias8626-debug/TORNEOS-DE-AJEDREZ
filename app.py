@@ -2976,10 +2976,49 @@ elif admin_choice == "Torneos Admin":
             else:
                 st.caption(f"{len(pending_wa)} partida(s) pendiente(s) · Los botones abren WhatsApp con el mensaje listo para enviar.")
 
+                import re as _re
                 from collections import defaultdict
                 by_round = defaultdict(list)
                 for m in pending_wa:
                     by_round[m["round_num"]].append(m)
+
+                # ── Mensaje para grupo ──────────────────────────────────
+                _t_num = _re.search(r'\d+', t["name"])
+                _t_abbr = f"T{_t_num.group()}" if _t_num else f"T{t['id']}"
+
+                # Posición de cada partida dentro de su ronda
+                _match_pos = {}
+                for _rn in by_round:
+                    _all = q("""
+                        SELECT m.id FROM matches m
+                        JOIN rounds r ON r.id=m.round_id
+                        WHERE m.tournament_id=? AND r.number=?
+                        ORDER BY m.id
+                    """, (t["id"], _rn))
+                    for _i, _rm in enumerate(_all, 1):
+                        _match_pos[_rm["id"]] = _i
+
+                _group_lines = []
+                for _rn in sorted(by_round.keys()):
+                    for _m in by_round[_rn]:
+                        _pos = _match_pos.get(_m["id"], "?")
+                        _pos_str = f"P{_pos:02d}" if isinstance(_pos, int) else f"P{_pos}"
+                        _wc = "".join(c for c in str(_m["white_cel"]) if c.isdigit()) if _m["white_cel"] else ""
+                        _bc = "".join(c for c in str(_m["black_cel"]) if c.isdigit()) if _m["black_cel"] else ""
+                        _wa_w = f"@{_wc}" if _wc else f"({_m['white_name']})"
+                        _wa_b = f"@{_bc}" if _bc else f"({_m['black_name']})"
+                        _group_lines.append(f"{_t_abbr} R{_rn} {_pos_str}  {_m['white_name']} vs {_m['black_name']}")
+                        _group_lines.append(f"{_wa_w} {_m['white_chess']} vs {_m['black_chess'] or '—'} {_wa_b}")
+                        _group_lines.append("")
+
+                st.text_area(
+                    "📋 Copiar para grupo de WhatsApp",
+                    value="\n".join(_group_lines).strip(),
+                    height=250,
+                    key=f"wa_group_{t['id']}",
+                )
+                st.divider()
+                # ── Individual por jugador ──────────────────────────────
 
                 for round_num in sorted(by_round.keys()):
                     matches_r = by_round[round_num]
