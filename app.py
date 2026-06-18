@@ -2969,6 +2969,85 @@ elif admin_choice == "Torneos Admin":
                     except Exception as exc:
                         st.error(exc)
 
+            st.divider()
+            st.subheader("👤 Gestionar inscripciones")
+
+            regs = q("""
+                SELECT r.id AS reg_id, r.status AS reg_status, r.wo_count,
+                       u.id AS user_id, u.display_name, u.chesscom_user
+                FROM registrations r
+                JOIN users u ON u.id = r.user_id
+                WHERE r.tournament_id=?
+                ORDER BY r.status, u.display_name
+            """, (t["id"],))
+
+            if regs:
+                STATUS_REG = {"active": "✅ Activo", "disqualified": "🚫 Descalificado", "removed": "❌ Retirado"}
+                reg_labels = {
+                    f"{r['display_name']} ({r['chesscom_user']})  —  {STATUS_REG.get(r['reg_status'], r['reg_status'])}": r
+                    for r in regs
+                }
+                sel_reg = st.selectbox("Jugador", list(reg_labels.keys()), key=f"reg_sel_{t['id']}")
+                reg = reg_labels[sel_reg]
+
+                ri1, ri2, ri3 = st.columns(3)
+                if ri1.button("✅ Activar", key=f"reg_act_{t['id']}", disabled=reg["reg_status"] == "active"):
+                    exec_sql("UPDATE registrations SET status='active' WHERE id=?", (reg["reg_id"],))
+                    audit(current_user["id"], "reg_activate", f"tournament={t['id']} user={reg['user_id']}")
+                    st.success(f"{reg['display_name']} activado.")
+                    st.rerun()
+
+                if ri2.button("❌ Retirar", key=f"reg_rem_{t['id']}", disabled=reg["reg_status"] == "removed"):
+                    exec_sql("UPDATE registrations SET status='removed' WHERE id=?", (reg["reg_id"],))
+                    audit(current_user["id"], "reg_remove", f"tournament={t['id']} user={reg['user_id']}")
+                    st.warning(f"{reg['display_name']} retirado.")
+                    st.rerun()
+
+                wo_pending = q("""
+                    SELECT m.id FROM matches m
+                    WHERE m.tournament_id=? AND m.status='pending' AND m.locked=0
+                      AND (m.white_user_id=? OR m.black_user_id=?)
+                """, (t["id"], reg["user_id"], reg["user_id"]))
+
+                if wo_pending:
+                    if ri3.button(f"⏱ WO {len(wo_pending)} partida(s) pendiente(s)", key=f"reg_wo_{t['id']}"):
+                        import datetime as _dt2
+                        for wm in wo_pending:
+                            match_full = q("SELECT * FROM matches WHERE id=?", (wm["id"],), one=True)
+                            if not match_full:
+                                continue
+                            if match_full["white_user_id"] == reg["user_id"]:
+                                result, w_score = "0-1", 0.0
+                            else:
+                                result, w_score = "1-0", 1.0
+                            exec_sql(
+                                "UPDATE matches SET status='finished', result=?, result_type='wo', locked=1, detected_at=? WHERE id=?",
+                                (result, _dt2.datetime.now(), wm["id"]),
+                            )
+                            apply_elo(wm["id"], match_full["white_user_id"], match_full["black_user_id"], w_score)
+                        audit(current_user["id"], "reg_wo_all", f"tournament={t['id']} user={reg['user_id']} matches={len(wo_pending)}")
+                        st.warning(f"WO aplicado a {len(wo_pending)} partida(s).")
+                        st.rerun()
+
+            st.divider()
+            st.subheader("➕ Inscribir jugador")
+            all_users_g = q("SELECT id, display_name, chesscom_user FROM users WHERE account_status='active' ORDER BY display_name")
+            registered_ids = {r["user_id"] for r in regs} if regs else set()
+            candidates = [u for u in all_users_g if u["id"] not in registered_ids]
+            if candidates:
+                cand_labels = {f"{u['display_name']} ({u['chesscom_user']})": u["id"] for u in candidates}
+                sel_cand = st.selectbox("Usuario a inscribir", list(cand_labels.keys()), key=f"inscribir_sel_{t['id']}")
+                if st.button("Inscribir", key=f"inscribir_btn_{t['id']}"):
+                    try:
+                        register_player(t["id"], cand_labels[sel_cand])
+                        audit(current_user["id"], "reg_add", f"tournament={t['id']} user={cand_labels[sel_cand]}")
+                        st.success("Jugador inscripto.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(exc)
+            else:
+                st.caption("Todos los usuarios activos ya están inscriptos.")
+
         # ── TAB AVISOS ────────────────────────────────────────────────
         with tab_avisos:
             if not pending_wa:
