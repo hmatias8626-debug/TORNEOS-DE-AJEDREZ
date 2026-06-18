@@ -4,6 +4,7 @@ import io
 import logging
 import os
 from pathlib import Path
+import urllib.parse
 
 import pandas as pd
 import requests
@@ -1526,6 +1527,18 @@ def match_score_parts(result, result_type):
     return ("", "")
 
 
+def wa_link(celular, mensaje):
+    """Devuelve URL de WhatsApp con mensaje pregenerado. Celular sin código país (ej: 3815123456)."""
+    if not celular:
+        return None
+    n = "".join(c for c in str(celular) if c.isdigit())
+    if not n:
+        return None
+    if not n.startswith("549"):
+        n = "549" + (n[2:] if n.startswith("54") else n)
+    return f"https://wa.me/{n}?text={urllib.parse.quote(mensaje)}"
+
+
 def match_status_badge(status, result_type):
     if result_type == "bye":
         return "🟦 LIBRE"
@@ -2809,8 +2822,22 @@ elif admin_choice == "Torneos Admin":
         review_count = len(q("SELECT id FROM matches WHERE tournament_id=? AND status='review'", (t["id"],)))
         gestión_label = f"🎯 Gestión  ({review_count})" if review_count > 0 else "🎯 Gestión"
 
-        tab_res, tab_gest, tab_cruces, tab_playoffs, tab_cfg = st.tabs([
-            "📊 Resumen", gestión_label, "📋 Cruces", "🏆 Playoffs", "⚙️ Config"
+        pending_wa = q("""
+            SELECT m.id, r.number AS round_num, r.end_datetime,
+                   wu.display_name AS white_name, wu.chesscom_user AS white_chess, wu.celular AS white_cel,
+                   bu.display_name AS black_name, bu.chesscom_user AS black_chess, bu.celular AS black_cel
+            FROM matches m
+            JOIN rounds r ON r.id=m.round_id
+            JOIN users wu ON wu.id=m.white_user_id
+            LEFT JOIN users bu ON bu.id=m.black_user_id
+            WHERE m.tournament_id=? AND m.status='pending' AND m.locked=0
+              AND m.black_user_id IS NOT NULL
+            ORDER BY r.number, m.id
+        """, (t["id"],))
+        avisos_label = f"📲 Avisos  ({len(pending_wa)})" if pending_wa else "📲 Avisos"
+
+        tab_res, tab_gest, tab_avisos, tab_cruces, tab_playoffs, tab_cfg = st.tabs([
+            "📊 Resumen", gestión_label, avisos_label, "📋 Cruces", "🏆 Playoffs", "⚙️ Config"
         ])
 
         # ── TAB RESUMEN ──────────────────────────────────────────────
@@ -2941,6 +2968,59 @@ elif admin_choice == "Torneos Admin":
                         st.rerun()
                     except Exception as exc:
                         st.error(exc)
+
+        # ── TAB AVISOS ────────────────────────────────────────────────
+        with tab_avisos:
+            if not pending_wa:
+                st.success("✅ No hay partidas pendientes en este torneo.")
+            else:
+                st.caption(f"{len(pending_wa)} partida(s) pendiente(s) · Los botones abren WhatsApp con el mensaje listo para enviar.")
+
+                from collections import defaultdict
+                by_round = defaultdict(list)
+                for m in pending_wa:
+                    by_round[m["round_num"]].append(m)
+
+                for round_num in sorted(by_round.keys()):
+                    matches_r = by_round[round_num]
+                    end_dt = parse_db_datetime(matches_r[0]["end_datetime"])
+                    fecha_str = end_dt.strftime("%d/%m/%Y %H:%M") if end_dt else "—"
+                    st.subheader(f"Ronda {round_num}  ·  vence {fecha_str}")
+
+                    for m in matches_r:
+                        msg_w = (
+                            f"Hola {m['white_name']}! ♟️ Recordatorio del {t['name']}.\n"
+                            f"Tenés una partida pendiente de la Ronda {round_num} "
+                            f"que vence el {fecha_str}.\n"
+                            f"Tu rival es {m['black_name']} ({m['black_chess'] or '—'}).\n"
+                            f"¡Coordiná y jugá antes del vencimiento!"
+                        )
+                        msg_b = (
+                            f"Hola {m['black_name']}! ♟️ Recordatorio del {t['name']}.\n"
+                            f"Tenés una partida pendiente de la Ronda {round_num} "
+                            f"que vence el {fecha_str}.\n"
+                            f"Tu rival es {m['white_name']} ({m['white_chess'] or '—'}).\n"
+                            f"¡Coordiná y jugá antes del vencimiento!"
+                        )
+
+                        col_w, col_vs, col_b = st.columns([5, 1, 5])
+                        with col_w:
+                            st.markdown(f"**{m['white_name']}**  \n`{m['white_chess']}`")
+                            link_w = wa_link(m["white_cel"], msg_w)
+                            if link_w:
+                                st.markdown(f"[📲 Avisar por WhatsApp]({link_w})", unsafe_allow_html=False)
+                            else:
+                                st.caption("⚠️ Sin celular registrado")
+                        with col_vs:
+                            st.markdown("<div style='text-align:center;padding-top:14px'>vs</div>", unsafe_allow_html=True)
+                        with col_b:
+                            st.markdown(f"**{m['black_name']}**  \n`{m['black_chess'] or 'LIBRE/BYE'}`")
+                            link_b = wa_link(m["black_cel"], msg_b)
+                            if link_b:
+                                st.markdown(f"[📲 Avisar por WhatsApp]({link_b})", unsafe_allow_html=False)
+                            else:
+                                st.caption("⚠️ Sin celular registrado")
+                        st.divider()
 
         # ── TAB CRUCES ────────────────────────────────────────────────
         with tab_cruces:
