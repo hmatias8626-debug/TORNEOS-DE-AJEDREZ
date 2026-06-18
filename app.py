@@ -2871,6 +2871,25 @@ elif admin_choice == "Torneos Admin":
                     st.warning(f"WO aplicados: {applied}")
                     st.rerun()
 
+                st.divider()
+                if t["status"] != "finished":
+                    confirm_finish = st.checkbox(
+                        "Confirmar que quiero finalizar este torneo",
+                        key=f"confirm_finish_{t['id']}",
+                    )
+                    if st.button("🏁 Finalizar torneo", key=f"finish_{t['id']}", disabled=not confirm_finish, type="primary"):
+                        exec_sql("UPDATE tournaments SET status='finished' WHERE id=?", (t["id"],))
+                        audit(current_user["id"], "finish_tournament", f"tournament={t['id']}")
+                        st.success("Torneo finalizado.")
+                        st.rerun()
+                else:
+                    st.success("✅ Este torneo está finalizado.")
+                    if st.button("↩ Reabrir torneo (volver a 'playing')", key=f"reopen_{t['id']}"):
+                        exec_sql("UPDATE tournaments SET status='playing' WHERE id=?", (t["id"],))
+                        audit(current_user["id"], "reopen_tournament", f"tournament={t['id']}")
+                        st.warning("Torneo reabierto.")
+                        st.rerun()
+
                 # Auto scan simple: refresh vía meta cada minuto si se activa
                 with st.expander("Motor automático y resultados manuales"):
                     auto = st.checkbox("Detectar automáticamente cada 1 minuto", key=f"auto_{t['id']}")
