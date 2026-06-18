@@ -875,6 +875,8 @@ def score_for_white(game):
 
 
 def apply_elo(match_id, white_id, black_id, white_score):
+    if black_id is None:
+        return  # bye match — no Elo change
     white = get_user(white_id)
     black = get_user(black_id)
     if not white or not black:
@@ -994,6 +996,15 @@ def scan_tournament(tournament_id):
     debug = []
 
     for match in pending:
+        if match.get("black_user_id") is None:
+            exec_sql(
+                "UPDATE matches SET status='finished', result='BYE', result_type='bye', locked=1, detected_at=? WHERE id=?",
+                (dt.datetime.now(), match["id"]),
+            )
+            found += 1
+            debug.append({"Cruce": f"{match['white_chess']} vs LIBRE/BYE", "Estado": "bye automático"})
+            continue
+
         start_dt = parse_db_datetime(match["start_datetime"])
         end_dt = parse_db_datetime(match["end_datetime"])
 
@@ -1956,6 +1967,13 @@ def _user_chess_names(user_id):
 
 
 def scan_single_match_for_job(tournament, match):
+    if match.get("black_user_id") is None:
+        exec_sql(
+            "UPDATE matches SET status='finished', result='BYE', result_type='bye', locked=1, detected_at=? WHERE id=?",
+            (dt.datetime.now(), match["id"]),
+        )
+        return "bye", "bye automático: el jugador gana sin modificar Elo", ""
+
     start_dt = parse_db_datetime(match["start_datetime"])
     end_dt = parse_db_datetime(match["end_datetime"])
 
