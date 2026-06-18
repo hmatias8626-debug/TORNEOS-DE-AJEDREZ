@@ -996,9 +996,9 @@ def scan_tournament(tournament_id):
     debug = []
 
     for match in pending:
-        if match.get("black_user_id") is None:
+        if match.get("black_user_id") is None or is_bye_value(match.get("black_chess")):
             exec_sql(
-                "UPDATE matches SET status='finished', result='BYE', result_type='bye', locked=1, detected_at=? WHERE id=?",
+                "UPDATE matches SET status='finished', result='BYE', result_type='bye', locked=1, black_user_id=NULL, detected_at=? WHERE id=?",
                 (dt.datetime.now(), match["id"]),
             )
             found += 1
@@ -1199,14 +1199,32 @@ def import_rounds_to_existing_tournament(df, tournament_id):
         for _, row in round_df.iterrows():
             white_raw = norm(row["blancas_chesscom"])
             black_raw = norm(row["negras_chesscom"])
-            if not valid_chess_username(white_raw) or not valid_chess_username(black_raw):
+            if not valid_chess_username(white_raw):
                 continue
 
             white_id, wc = get_or_create_player(white_raw)
-            black_id, bc = get_or_create_player(black_raw)
-            created_players += int(wc) + int(bc)
-
+            created_players += int(wc)
             register_player(tournament_id, white_id)
+
+            if is_bye_value(black_raw):
+                exists_bye = q(
+                    "SELECT id FROM matches WHERE tournament_id=? AND round_id=? AND white_user_id=? AND black_user_id IS NULL",
+                    (tournament_id, round_id, white_id), one=True,
+                )
+                if not exists_bye:
+                    insert_returning(
+                        "matches",
+                        ["tournament_id", "round_id", "white_user_id", "black_user_id", "status", "result", "result_type", "locked"],
+                        [tournament_id, round_id, white_id, None, "finished", "BYE", "bye", 1],
+                    )
+                    created_matches += 1
+                continue
+
+            if not valid_chess_username(black_raw):
+                continue
+
+            black_id, bc = get_or_create_player(black_raw)
+            created_players += int(bc)
             register_player(tournament_id, black_id)
 
             exists = q("""
@@ -1967,9 +1985,9 @@ def _user_chess_names(user_id):
 
 
 def scan_single_match_for_job(tournament, match):
-    if match.get("black_user_id") is None:
+    if match.get("black_user_id") is None or is_bye_value(match.get("black_chess")):
         exec_sql(
-            "UPDATE matches SET status='finished', result='BYE', result_type='bye', locked=1, detected_at=? WHERE id=?",
+            "UPDATE matches SET status='finished', result='BYE', result_type='bye', locked=1, black_user_id=NULL, detected_at=? WHERE id=?",
             (dt.datetime.now(), match["id"]),
         )
         return "bye", "bye automático: el jugador gana sin modificar Elo", ""
