@@ -1009,6 +1009,9 @@ def scan_tournament(tournament_id):
             debug.append({"Cruce": f"{match['white_chess']} vs {match['black_chess']}", "Estado": "usuario inexistente en Chess.com: " + ", ".join(missing)})
             continue
 
+        white_names = _user_chess_names(match["white_user_id"])
+        black_names = _user_chess_names(match["black_user_id"])
+
         games = chess_games_between(match["white_chess"], start_dt, end_dt)
         games += chess_games_between(match["black_chess"], start_dt, end_dt)
 
@@ -1028,9 +1031,12 @@ def scan_tournament(tournament_id):
                 final_reason = "partida invertida rechazada previamente"
                 continue
 
-            exact, inverted = game_is_between_players_any_color(game, match["white_user_id"], match["black_user_id"])
+            actual_white = norm(game.get("white", {}).get("username"))
+            actual_black = norm(game.get("black", {}).get("username"))
+            exact    = actual_white in white_names and actual_black in black_names
+            inverted = actual_white in black_names and actual_black in white_names
+
             if not exact and not inverted:
-                final_reason = "usuarios no coinciden"
                 continue
 
             ok, reason = validate_game_without_color(game, tournament, start_dt, end_dt)
@@ -1038,11 +1044,14 @@ def scan_tournament(tournament_id):
                 final_reason = reason
                 continue
 
-            score = score_for_fixture_white(game, match["white_user_id"], match["black_user_id"])
-            if score is None:
+            actual_score_white = score_for_white(game)
+            if actual_score_white is None:
                 final_reason = "partida encontrada sin resultado interpretable"
                 continue
 
+            score = actual_score_white if actual_white in white_names else (
+                1.0 - actual_score_white if actual_score_white != 0.5 else 0.5
+            )
             result = result_label(score)
 
             if exact:
@@ -2401,6 +2410,52 @@ def render_fast_player_tournament_view(tournament, user):
 
     with tabs[4]:
         render_awards(tournament["id"])
+
+
+# =========================================================
+# SCHEDULER AUTOMÁTICO (cada 30 minutos)
+# =========================================================
+
+import threading as _threading
+
+_scheduler_lock = _threading.Lock()
+_scheduler_started = False
+
+
+def _auto_scan_all():
+    try:
+        torneos = q("SELECT id FROM tournaments WHERE status='playing'")
+        for t in torneos:
+            try:
+                logger.info("Scheduler: escaneando torneo %s", t["id"])
+                scan_tournament(t["id"])
+            except Exception as e:
+                logger.exception("Scheduler: error en torneo %s: %s", t["id"], e)
+    except Exception as e:
+        logger.exception("Scheduler: error obteniendo torneos: %s", e)
+
+
+def _scheduler_loop():
+    import time as _time
+    while True:
+        _time.sleep(1800)  # 30 minutos
+        try:
+            _auto_scan_all()
+        except Exception as e:
+            logger.exception("Scheduler: error inesperado: %s", e)
+
+
+def _start_scheduler():
+    global _scheduler_started
+    with _scheduler_lock:
+        if not _scheduler_started:
+            _scheduler_started = True
+            t = _threading.Thread(target=_scheduler_loop, daemon=True)
+            t.start()
+            logger.info("Scheduler iniciado: escaneo automático cada 30 minutos")
+
+
+_start_scheduler()
 
 
 # =========================================================
