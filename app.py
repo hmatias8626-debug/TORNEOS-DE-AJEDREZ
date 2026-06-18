@@ -1665,11 +1665,21 @@ def register_current_player(tournament_id, user_id):
 
 def tournament_kpis(tournament_id):
     players = q("SELECT COUNT(*) AS c FROM registrations WHERE tournament_id=? AND status!='removed'", (tournament_id,), one=True)["c"]
-    matches = q("SELECT COUNT(*) AS c FROM matches WHERE tournament_id=?", (tournament_id,), one=True)["c"]
-    finished = q("SELECT COUNT(*) AS c FROM matches WHERE tournament_id=? AND status='finished'", (tournament_id,), one=True)["c"]
-    pending = q("SELECT COUNT(*) AS c FROM matches WHERE tournament_id=? AND status='pending'", (tournament_id,), one=True)["c"]
-    review = q("SELECT COUNT(*) AS c FROM matches WHERE tournament_id=? AND status='review'", (tournament_id,), one=True)["c"]
-    return {"Jugadores": players, "Cruces": matches, "Finalizadas": finished, "Pendientes": pending, "Revisión": review}
+    row = q(
+        "SELECT COUNT(*) AS total,"
+        " SUM(CASE WHEN status='finished' THEN 1 ELSE 0 END) AS finished,"
+        " SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,"
+        " SUM(CASE WHEN status='review' THEN 1 ELSE 0 END) AS review"
+        " FROM matches WHERE tournament_id=?",
+        (tournament_id,), one=True,
+    )
+    return {
+        "Jugadores": players,
+        "Cruces": row["total"] or 0,
+        "Finalizadas": row["finished"] or 0,
+        "Pendientes": row["pending"] or 0,
+        "Revisión": row["review"] or 0,
+    }
 
 
 def player_match_rows(tournament_id, user_id):
@@ -2462,8 +2472,10 @@ _start_scheduler()
 # UI
 # =========================================================
 
-init_db()
-ensure_v9_columns()
+if "db_initialized" not in st.session_state:
+    init_db()
+    ensure_v9_columns()
+    st.session_state.db_initialized = True
 
 if "user" not in st.session_state:
     st.session_state.user = None
