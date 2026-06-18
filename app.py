@@ -1923,16 +1923,23 @@ def scan_single_match_for_job(tournament, match):
         unique.append(game)
 
     final_reason = "sin partidas de los jugadores en el rango"
+    found_players_game = False
 
     for game in unique:
         if match.get("rejected_game_uuid") and game.get("uuid") == match.get("rejected_game_uuid"):
             final_reason = "partida invertida rechazada previamente"
+            found_players_game = True
             continue
 
         exact, inverted = game_is_between_players_any_color(game, match["white_user_id"], match["black_user_id"])
         if not exact and not inverted:
-            final_reason = "usuarios no coinciden"
+            # No sobreescribir si ya encontramos una partida de estos jugadores
+            if not found_players_game:
+                final_reason = "sin partidas de los jugadores en el rango"
             continue
+
+        # A partir de acá la partida es entre los jugadores correctos
+        found_players_game = True
 
         ok, reason = validate_game_without_color(game, tournament, start_dt, end_dt)
         if not ok:
@@ -1959,6 +1966,7 @@ def scan_single_match_for_job(tournament, match):
         if inverted:
             if mark_color_review(match, game):
                 return "revision", "colores invertidos: requiere aceptar o rechazar", game.get("url") or ""
+            final_reason = "colores invertidos: pendiente de revisión"
 
     return "pendiente", final_reason, ""
 
