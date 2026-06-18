@@ -3322,7 +3322,7 @@ elif admin_choice == "Admin usuarios":
             st.success("Usuario actualizado.")
             st.rerun()
 
-elif choice == "Mi perfil":
+if choice == "Mi perfil":
     st.header("Mi perfil")
     if current_user.get("avatar_url"):
         st.image(current_user["avatar_url"], width=150)
