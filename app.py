@@ -3191,19 +3191,75 @@ elif admin_choice == "Admin usuarios":
             st.success("Contraseña reseteada.")
             st.rerun()
 
-        if is_admin(current_user):
-            st.subheader("Cambiar rol / estado / ELO")
-            edit_target = st.selectbox("Usuario a modificar", list(labels.keys()), key="edit_user")
-            edit_user = get_user(labels[edit_target])
-            roles = ["player", "moderator", "admin"] + (["superadmin"] if is_superadmin(current_user) else [])
-            role = st.selectbox("Rol", roles, index=roles.index(edit_user["role"]) if edit_user["role"] in roles else 0)
-            status = st.selectbox("Estado", ["pending", "active", "suspended"], index=["pending", "active", "suspended"].index(edit_user["account_status"]) if edit_user["account_status"] in ["pending", "active", "suspended"] else 1)
-            elo = st.number_input("ELO", value=int(edit_user["elo"]), step=10)
+    st.subheader("📲 Importar celulares desde Excel")
+    st.caption("Subí el Excel con la hoja 'jugadores' (columnas: Cod, Nombre, Usuario, Alias, Celular, …)")
+    cel_file = st.file_uploader("Archivo Excel (.xlsx)", type=["xlsx"], key="cel_import")
+    if cel_file:
+        try:
+            df_jug = pd.read_excel(cel_file, sheet_name="jugadores", header=0)
+            df_jug.columns = [str(c).strip() for c in df_jug.columns]
+            col_usuario = df_jug.columns[2]
+            col_celular = df_jug.columns[4]
+            df_jug = df_jug[[col_usuario, col_celular]].dropna(subset=[col_usuario])
+            df_jug[col_celular] = df_jug[col_celular].apply(
+                lambda v: "".join(c for c in str(v) if c.isdigit()) if pd.notna(v) else ""
+            )
+            df_jug = df_jug[df_jug[col_celular].str.len() >= 8]
 
-            if st.button("Guardar usuario"):
-                exec_sql("UPDATE users SET role=?, account_status=?, elo=? WHERE id=?", (role, status, int(elo), edit_user["id"]))
-                st.success("Usuario actualizado.")
+            all_users = q("SELECT id, display_name, chesscom_user, celular FROM users")
+            user_map = {(u["chesscom_user"] or "").lower(): u for u in all_users}
+
+            preview = []
+            updates = []
+            for _, row in df_jug.iterrows():
+                username_raw = str(row[col_usuario]).strip()
+                celular_raw = str(row[col_celular]).strip()
+                u = user_map.get(username_raw.lower())
+                if u:
+                    preview.append({
+                        "Chess.com": u["chesscom_user"],
+                        "Nombre": u["display_name"],
+                        "Celular actual": u.get("celular") or "—",
+                        "Celular nuevo": celular_raw,
+                        "Acción": "actualizar" if (u.get("celular") or "") != celular_raw else "sin cambio",
+                    })
+                    if (u.get("celular") or "") != celular_raw:
+                        updates.append((celular_raw, u["id"]))
+                else:
+                    preview.append({
+                        "Chess.com": username_raw,
+                        "Nombre": "—",
+                        "Celular actual": "—",
+                        "Celular nuevo": celular_raw,
+                        "Acción": "⚠️ no encontrado",
+                    })
+
+            st.dataframe(preview, use_container_width=True)
+            n_updates = len(updates)
+            n_notfound = sum(1 for p in preview if p["Acción"] == "⚠️ no encontrado")
+            st.caption(f"{n_updates} actualización(es) pendiente(s)  ·  {n_notfound} usuario(s) no encontrado(s) en la base")
+
+            if n_updates > 0 and st.button(f"💾 Importar {n_updates} celular(es)"):
+                for cel, uid in updates:
+                    exec_sql("UPDATE users SET celular=? WHERE id=?", (cel, uid))
+                st.success(f"✅ {n_updates} celular(es) importados correctamente.")
                 st.rerun()
+        except Exception as exc:
+            st.error(f"Error al leer el Excel: {exc}")
+
+    if labels and is_admin(current_user):
+        st.subheader("Cambiar rol / estado / ELO")
+        edit_target = st.selectbox("Usuario a modificar", list(labels.keys()), key="edit_user")
+        edit_user = get_user(labels[edit_target])
+        roles = ["player", "moderator", "admin"] + (["superadmin"] if is_superadmin(current_user) else [])
+        role = st.selectbox("Rol", roles, index=roles.index(edit_user["role"]) if edit_user["role"] in roles else 0)
+        status = st.selectbox("Estado", ["pending", "active", "suspended"], index=["pending", "active", "suspended"].index(edit_user["account_status"]) if edit_user["account_status"] in ["pending", "active", "suspended"] else 1)
+        elo = st.number_input("ELO", value=int(edit_user["elo"]), step=10)
+
+        if st.button("Guardar usuario"):
+            exec_sql("UPDATE users SET role=?, account_status=?, elo=? WHERE id=?", (role, status, int(elo), edit_user["id"]))
+            st.success("Usuario actualizado.")
+            st.rerun()
 
 elif choice == "Mi perfil":
     st.header("Mi perfil")
