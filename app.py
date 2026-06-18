@@ -1975,6 +1975,7 @@ def prefetch_player_games(usernames, start_dt, end_dt):
     from concurrent.futures import ThreadPoolExecutor
     valid = [norm(u) for u in usernames if valid_chess_username(u)]
     def _fetch(u):
+        chess_profile(u)  # calienta cache para chess_user_exists en el loop
         chess_games_between(u, start_dt, end_dt)
     with ThreadPoolExecutor(max_workers=3) as ex:
         list(ex.map(_fetch, valid))
