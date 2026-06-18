@@ -1372,6 +1372,8 @@ def raw_points_for_user(tournament_id, user_id, points_cfg):
 
 
 def standings(tournament_id):
+    from collections import defaultdict
+
     tournament = q("SELECT * FROM tournaments WHERE id=?", (tournament_id,), one=True)
     points_cfg = tournament_points_config(tournament or {})
 
@@ -1382,43 +1384,70 @@ def standings(tournament_id):
         WHERE r.tournament_id=? AND r.status!='removed'
     """, (tournament_id,))
 
-    base_points = {u["id"]: raw_points_for_user(tournament_id, u["id"], points_cfg) for u in regs}
+    # Una sola query para todas las partidas terminadas del torneo
+    all_matches = q("""
+        SELECT * FROM matches
+        WHERE tournament_id=? AND status='finished'
+    """, (tournament_id,))
+
+    # Agrupar partidas por jugador
+    player_matches = defaultdict(list)
+    for m in all_matches:
+        player_matches[m["white_user_id"]].append(m)
+        if m["black_user_id"]:
+            player_matches[m["black_user_id"]].append(m)
+
+    # Calcular puntos base para todos los jugadores
+    base_points = {}
+    for user in regs:
+        uid = user["id"]
+        pts = 0.0
+        for m in player_matches[uid]:
+            if m["result_type"] == "bye" or m["result"] == "BYE":
+                if m["white_user_id"] == uid:
+                    pts += points_cfg["bye"]
+                continue
+            if m["result_type"] == "wo":
+                pts += points_cfg["wo"]
+                continue
+            if m["white_user_id"] == uid:
+                if m["result"] == "1-0":   pts += points_cfg["win"]
+                elif m["result"] == "0-1": pts += points_cfg["loss"]
+                elif m["result"] == "1/2-1/2": pts += points_cfg["draw"]
+            else:
+                if m["result"] == "0-1":   pts += points_cfg["win"]
+                elif m["result"] == "1-0": pts += points_cfg["loss"]
+                elif m["result"] == "1/2-1/2": pts += points_cfg["draw"]
+        base_points[uid] = pts
 
     table = []
     for user in regs:
-        matches = q("""
-            SELECT * FROM matches
-            WHERE tournament_id=? AND status='finished'
-            AND (white_user_id=? OR black_user_id=?)
-        """, (tournament_id, user["id"], user["id"]))
+        uid = user["id"]
+        wins = draws = losses = wo_count = byes = real_played = 0
+        opponents = []
 
-        wins = draws = losses = wo = byes = real_played = 0
-        for match in matches:
-            if match["result_type"] == "bye" or match["result"] == "BYE":
+        for m in player_matches[uid]:
+            if m["result_type"] == "bye" or m["result"] == "BYE":
                 byes += 1
                 continue
-
-            if match["result_type"] == "wo":
-                wo += 1
+            if m["result_type"] == "wo":
+                wo_count += 1
                 continue
 
             real_played += 1
-            if match["white_user_id"] == user["id"]:
-                if match["result"] == "1-0":
-                    wins += 1
-                elif match["result"] == "0-1":
-                    losses += 1
-                elif match["result"] == "1/2-1/2":
-                    draws += 1
-            else:
-                if match["result"] == "0-1":
-                    wins += 1
-                elif match["result"] == "1-0":
-                    losses += 1
-                elif match["result"] == "1/2-1/2":
-                    draws += 1
+            opp = m["black_user_id"] if m["white_user_id"] == uid else m["white_user_id"]
+            if opp is not None:
+                opponents.append(opp)
 
-        opponents = head_to_head_opponents(tournament_id, user["id"])
+            if m["white_user_id"] == uid:
+                if m["result"] == "1-0":       wins += 1
+                elif m["result"] == "0-1":     losses += 1
+                elif m["result"] == "1/2-1/2": draws += 1
+            else:
+                if m["result"] == "0-1":       wins += 1
+                elif m["result"] == "1-0":     losses += 1
+                elif m["result"] == "1/2-1/2": draws += 1
+
         buchholz = sum(base_points.get(op, 0) for op in opponents)
         opp_scores = sorted([base_points.get(op, 0) for op in opponents])
         buc1 = sum(opp_scores[1:]) if len(opp_scores) > 1 else buchholz
@@ -1434,7 +1463,7 @@ def standings(tournament_id):
             "P": losses,
             "WO": user["wo_count"],
             "Estado": user["status"],
-            "Puntos": base_points[user["id"]],
+            "Puntos": base_points[uid],
             "Buchholz": round(buchholz, 2),
             "Buc1": round(buc1, 2),
         })
@@ -2094,7 +2123,7 @@ def render_motor_panel():
 # V10.3 FAST VIEWS / REVIEWS / SANCTIONS
 # =========================================================
 
-@st.cache_data(ttl=20)
+@st.cache_data(ttl=60)
 def cached_standings_for_tournament(tournament_id, revision_key=0):
     return standings(tournament_id)
 
