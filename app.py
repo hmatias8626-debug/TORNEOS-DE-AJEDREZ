@@ -549,21 +549,38 @@ def ensure_v9_columns():
 
 
 def ensure_match_reports_table():
-    exec_sql("""
-        CREATE TABLE IF NOT EXISTS match_reports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tournament_id INTEGER,
-            match_id INTEGER,
-            alert_type TEXT,
-            detail TEXT,
-            game_url TEXT,
-            white_chess TEXT,
-            black_chess TEXT,
-            round_num INTEGER,
-            resolved INTEGER DEFAULT 0,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
+    if use_postgres():
+        exec_sql("""
+            CREATE TABLE IF NOT EXISTS match_reports (
+                id SERIAL PRIMARY KEY,
+                tournament_id INTEGER,
+                match_id INTEGER,
+                alert_type TEXT,
+                detail TEXT,
+                game_url TEXT,
+                white_chess TEXT,
+                black_chess TEXT,
+                round_num INTEGER,
+                resolved INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+    else:
+        exec_sql("""
+            CREATE TABLE IF NOT EXISTS match_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tournament_id INTEGER,
+                match_id INTEGER,
+                alert_type TEXT,
+                detail TEXT,
+                game_url TEXT,
+                white_chess TEXT,
+                black_chess TEXT,
+                round_num INTEGER,
+                resolved INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
 
 def insert_returning(table, cols, values):
