@@ -290,6 +290,22 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS match_reports (
+            id SERIAL PRIMARY KEY,
+            tournament_id INTEGER,
+            match_id INTEGER,
+            alert_type TEXT,
+            detail TEXT,
+            game_url TEXT,
+            white_chess TEXT,
+            black_chess TEXT,
+            round_num INTEGER,
+            resolved INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
     else:
         cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -466,6 +482,22 @@ def init_db():
         )
         """)
 
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS match_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tournament_id INTEGER,
+            match_id INTEGER,
+            alert_type TEXT,
+            detail TEXT,
+            game_url TEXT,
+            white_chess TEXT,
+            black_chess TEXT,
+            round_num INTEGER,
+            resolved INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+
     c.commit()
     c.close()
 
@@ -514,6 +546,24 @@ def ensure_v9_columns():
     ]
     for table, col, definition in cols:
         ensure_column_runtime(table, col, definition)
+
+
+def ensure_match_reports_table():
+    exec_sql("""
+        CREATE TABLE IF NOT EXISTS match_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tournament_id INTEGER,
+            match_id INTEGER,
+            alert_type TEXT,
+            detail TEXT,
+            game_url TEXT,
+            white_chess TEXT,
+            black_chess TEXT,
+            round_num INTEGER,
+            resolved INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
 
 
 def insert_returning(table, cols, values):
@@ -1922,6 +1972,16 @@ def add_scan_item(job_id, match_id, cruce, status, detail="", chesscom_url=""):
     )
 
 
+def add_match_report(tournament_id, match_id, alert_type, detail, game_url, white_chess, black_chess, round_num):
+    # Only insert if not already exists for this match+game_url
+    existing = q("SELECT id FROM match_reports WHERE match_id=? AND game_url=? AND resolved=0", (match_id, game_url or ""), one=True)
+    if not existing:
+        insert_returning("match_reports",
+            ["tournament_id", "match_id", "alert_type", "detail", "game_url", "white_chess", "black_chess", "round_num"],
+            [tournament_id, match_id, alert_type, detail, game_url or "", white_chess, black_chess, round_num]
+        )
+
+
 def update_scan_job_counts(job_id):
     counts = q("""
         SELECT
@@ -2060,6 +2120,22 @@ def scan_single_match_for_job(tournament, match):
         ok, reason = validate_game_without_color(game, tournament, start_dt, end_dt)
         if not ok:
             final_reason = reason
+            # Classify alert type
+            if "ritmo" in reason:
+                atype = "wrong_time_control"
+            elif "clase" in reason:
+                atype = "wrong_class"
+            elif "modalidad" in reason:
+                atype = "wrong_rules"
+            else:
+                atype = "other"
+            # Get round_num for this match
+            _rn = q("SELECT r.number FROM rounds r WHERE r.id=?", (match.get("round_id"),), one=True)
+            _round_num = _rn["number"] if _rn else 0
+            add_match_report(
+                match["tournament_id"], match["id"], atype, reason,
+                game.get("url"), match["white_chess"], match["black_chess"], _round_num
+            )
             continue
 
         # Calcular score usando los sets precargados (sin DB)
@@ -2525,6 +2601,7 @@ _start_scheduler()
 if "db_initialized" not in st.session_state:
     init_db()
     ensure_v9_columns()
+    ensure_match_reports_table()
     st.session_state.db_initialized = True
 
 if "user" not in st.session_state:
@@ -2836,8 +2913,11 @@ elif admin_choice == "Torneos Admin":
         """, (t["id"],))
         avisos_label = f"📲 Avisos  ({len(pending_wa)})" if pending_wa else "📲 Avisos"
 
-        tab_res, tab_gest, tab_avisos, tab_cruces, tab_playoffs, tab_cfg = st.tabs([
-            "📊 Resumen", gestión_label, avisos_label, "📋 Cruces", "🏆 Playoffs", "⚙️ Config"
+        reports_count = len(q("SELECT id FROM match_reports WHERE tournament_id=? AND resolved=0", (t["id"],)))
+        inf_label = f"🔎 Informes  ({reports_count})" if reports_count else "🔎 Informes"
+
+        tab_res, tab_gest, tab_avisos, tab_cruces, tab_playoffs, tab_cfg, tab_inf = st.tabs([
+            "📊 Resumen", gestión_label, avisos_label, "📋 Cruces", "🏆 Playoffs", "⚙️ Config", inf_label
         ])
 
         # ── TAB RESUMEN ──────────────────────────────────────────────
@@ -3139,6 +3219,40 @@ elif admin_choice == "Torneos Admin":
                             else:
                                 st.caption("⚠️ Sin celular registrado")
                         st.divider()
+
+        # ── TAB INFORMES ──────────────────────────────────────────────
+        with tab_inf:
+            reports = q("""
+                SELECT mr.*, mr.round_num AS round_num_db
+                FROM match_reports mr
+                WHERE mr.tournament_id=? AND mr.resolved=0
+                ORDER BY mr.created_at DESC
+            """, (t["id"],))
+
+            # Also show resolved ones in expander
+            resolved_reports = q("""
+                SELECT * FROM match_reports WHERE tournament_id=? AND resolved=1 ORDER BY created_at DESC LIMIT 50
+            """, (t["id"],))
+
+            if not reports:
+                st.success("✅ Sin informes pendientes.")
+            else:
+                st.warning(f"⚠️ {len(reports)} informe(s) pendiente(s) de partidas jugadas fuera de condiciones.")
+                for rp in reports:
+                    with st.expander(f"R{rp['round_num']}  {rp['white_chess']} vs {rp['black_chess']}  —  {rp['alert_type']}", expanded=True):
+                        st.write(f"**Detalle:** {rp['detail']}")
+                        if rp["game_url"]:
+                            st.write(f"**Partida:** {rp['game_url']}")
+                        st.caption(f"Detectado: {rp['created_at']}")
+                        if st.button("✅ Marcar como resuelto", key=f"resolve_report_{rp['id']}"):
+                            exec_sql("UPDATE match_reports SET resolved=1 WHERE id=?", (rp["id"],))
+                            st.success("Marcado como resuelto.")
+                            st.rerun()
+
+            if resolved_reports:
+                with st.expander(f"Historial ({len(resolved_reports)} resueltos)"):
+                    for rp in resolved_reports:
+                        st.write(f"R{rp['round_num']} | {rp['white_chess']} vs {rp['black_chess']} | {rp['detail']} | {rp['game_url'] or '—'}")
 
         # ── TAB CRUCES ────────────────────────────────────────────────
         with tab_cruces:
