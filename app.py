@@ -1624,8 +1624,8 @@ def match_status_badge(status, result_type):
 def round_visual_rows(tournament_id, round_number):
     rows = q("""
         SELECT m.*, r.number, r.start_datetime, r.end_datetime,
-               wu.display_name AS white_name, wu.chesscom_user AS white_chess, wu.elo AS white_elo,
-               bu.display_name AS black_name, bu.chesscom_user AS black_chess, bu.elo AS black_elo
+               wu.display_name AS white_name, wu.chesscom_user AS white_chess, wu.elo AS white_elo, wu.short_name AS white_short,
+               bu.display_name AS black_name, bu.chesscom_user AS black_chess, bu.elo AS black_elo, bu.short_name AS black_short
         FROM matches m
         JOIN rounds r ON r.id=m.round_id
         JOIN users wu ON wu.id=m.white_user_id
@@ -1637,15 +1637,17 @@ def round_visual_rows(tournament_id, round_number):
     out = []
     for m in rows:
         ws, bs = match_score_parts(m.get("result"), m.get("result_type"))
+        w_label = m["white_short"] or m["white_name"]
+        b_label = m["black_short"] or m["black_name"] or "LIBRE/BYE"
         out.append({
             "♙ ELO": m["white_elo"],
-            "Blancas": m["white_name"],
+            "Blancas": w_label,
             "Usuario blancas": m["white_chess"],
             "Pts": ws,
             "VS": "vs",
             "Pts ": bs,
             "Usuario negras": m["black_chess"] or "LIBRE/BYE",
-            "Negras": m["black_name"] or "LIBRE/BYE",
+            "Negras": b_label,
             "♟ ELO": m["black_elo"] if m["black_elo"] is not None else "",
             "Fecha": str(m["start_datetime"])[:10],
             "Estado": match_status_badge(m["status"], m["result_type"]),
@@ -3417,7 +3419,7 @@ elif admin_choice == "Admin usuarios":
         "ID": u["id"],
         "Nombre": u["display_name"],
         "Usuario": u["username"],
-        "Chess.com": u["chesscom_user"],
+        "Alias": u.get("short_name") or "",
         "Celular": u.get("celular") or "",
         "Rol": u["role"],
         "ELO": u["elo"],
