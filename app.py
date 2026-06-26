@@ -3086,7 +3086,16 @@ elif admin_choice == "Torneos Admin":
                 ORDER BY r.number, m.id
             """, (t["id"],))
             if all_matches_g:
-                match_labels = {f"R{m['number']} | {m['white_chess']} vs {m['black_chess'] or 'LIBRE/BYE'} | {m['status']} | {m['result'] or 'sin resultado'}": m["id"] for m in all_matches_g}
+                # Calcular posición de cada partida dentro de su ronda
+                _rnd_counter = {}
+                for _m in all_matches_g:
+                    _rn = _m["number"]
+                    _rnd_counter[_rn] = _rnd_counter.get(_rn, 0) + 1
+                    _m["_pos"] = _rnd_counter[_rn]
+                match_labels = {
+                    f"R{m['number']} P{m['_pos']:02d} | {m['white_chess']} vs {m['black_chess'] or 'LIBRE/BYE'} | {m['status']} | {m['result'] or 'sin resultado'}": m["id"]
+                    for m in all_matches_g
+                }
                 sel_m = st.selectbox("Partida", list(match_labels.keys()), key=f"manual_match_g_{t['id']}")
                 res_m = st.selectbox("Resultado", ["1-0", "0-1", "1/2-1/2"], key=f"manual_res_g_{t['id']}")
                 gm1, gm2 = st.columns(2)
