@@ -60,6 +60,42 @@ def conn():
     return pg_conn() if use_postgres() else sqlite_conn()
 
 
+# =========================================================
+# SUPABASE STORAGE
+# =========================================================
+_STORAGE_BUCKET = "archivos"
+_STORAGE_FILENAME = "ajedrez_ELO.xlsx"
+
+def _storage_secrets_ok():
+    return "SUPABASE_URL" in st.secrets and "SUPABASE_KEY" in st.secrets
+
+def supabase_excel_exists():
+    if not _storage_secrets_ok():
+        return False
+    url = f"{st.secrets['SUPABASE_URL']}/storage/v1/object/public/{_STORAGE_BUCKET}/{_STORAGE_FILENAME}"
+    try:
+        r = requests.head(url, timeout=5)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+def supabase_download_excel():
+    url = f"{st.secrets['SUPABASE_URL']}/storage/v1/object/public/{_STORAGE_BUCKET}/{_STORAGE_FILENAME}"
+    r = requests.get(url, timeout=15)
+    r.raise_for_status()
+    return io.BytesIO(r.content)
+
+def supabase_upload_excel(file_bytes: bytes):
+    url = f"{st.secrets['SUPABASE_URL']}/storage/v1/object/{_STORAGE_BUCKET}/{_STORAGE_FILENAME}"
+    headers = {
+        "Authorization": f"Bearer {st.secrets['SUPABASE_KEY']}",
+        "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "x-upsert": "true",
+    }
+    r = requests.put(url, headers=headers, data=file_bytes, timeout=30)
+    r.raise_for_status()
+
+
 def adapt_sql(sql):
     if use_postgres():
         return sql.replace("?", "%s")
@@ -3477,156 +3513,127 @@ elif admin_choice == "Admin usuarios":
             st.success("Contraseña reseteada.")
             st.rerun()
 
+    # ── Excel en Supabase Storage ──────────────────────────────
+    st.subheader("📁 Excel de jugadores (Supabase Storage)")
+    if not _storage_secrets_ok():
+        st.warning("Configurá SUPABASE_URL y SUPABASE_KEY en los Secrets de Streamlit para habilitar Supabase Storage.")
+    else:
+        _excel_ok = supabase_excel_exists()
+        if _excel_ok:
+            st.success(f"✅ Archivo **{_STORAGE_FILENAME}** guardado en Supabase Storage.")
+        else:
+            st.info(f"No hay archivo guardado aún. Subí uno abajo.")
+        up_excel = st.file_uploader(
+            "Subir / actualizar Excel en Supabase Storage",
+            type=["xlsx"],
+            key="storage_upload",
+            help="Se guarda en el bucket 'archivos' y queda disponible para todos los imports."
+        )
+        if up_excel and st.button("⬆️ Guardar en Supabase Storage"):
+            try:
+                supabase_upload_excel(up_excel.read())
+                st.success("✅ Excel guardado en Supabase Storage.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Error al subir: {exc}")
+
+    def _load_excel_df():
+        """Descarga el Excel de Supabase Storage y devuelve el DataFrame de la hoja jugadores."""
+        buf = supabase_download_excel()
+        df = pd.read_excel(buf, sheet_name="jugadores", header=0)
+        df.columns = [str(c).strip() for c in df.columns]
+        return df
+
+    def _build_user_maps():
+        all_u = q("SELECT id, display_name, chesscom_user, celular, short_name FROM users")
+        all_al = q("SELECT user_id, alias FROM chess_aliases")
+        by_chess  = {(u["chesscom_user"] or "").lower(): u for u in all_u if u["chesscom_user"]}
+        by_disp   = {(u["display_name"]  or "").lower(): u for u in all_u if u["display_name"]}
+        al_uid    = {(a["alias"] or "").lower(): a["user_id"] for a in all_al}
+        uid_map   = {u["id"]: u for u in all_u}
+        def find(username_raw, nombre_raw):
+            k = (username_raw or "").lower()
+            if k and k in by_chess:  return by_chess[k], "usuario"
+            if k and k in al_uid:    return uid_map[al_uid[k]], "alias"
+            n = (nombre_raw or "").lower()
+            if n and n in by_disp:   return by_disp[n], "nombre"
+            return None, None
+        return find
+
+    # ── Importar celulares ──────────────────────────────────
     st.subheader("📲 Importar celulares desde Excel")
-    st.caption("Subí el Excel con la hoja 'jugadores' (columnas: Cod, Nombre, Usuario, Alias, Celular, …)")
-    cel_file = st.file_uploader("Archivo Excel (.xlsx)", type=["xlsx"], key="cel_import")
-    if cel_file:
+    if _storage_secrets_ok() and st.button("📥 Importar celulares desde Supabase Storage", key="cel_from_storage"):
         try:
-            df_jug = pd.read_excel(cel_file, sheet_name="jugadores", header=0)
-            df_jug.columns = [str(c).strip() for c in df_jug.columns]
-            col_nombre   = df_jug.columns[1]
-            col_usuario  = df_jug.columns[2]
-            col_celular  = df_jug.columns[4]
+            df_jug = _load_excel_df()
+            col_nombre  = df_jug.columns[1]
+            col_usuario = df_jug.columns[2]
+            col_celular = df_jug.columns[4]
             df_jug[col_celular] = df_jug[col_celular].apply(
                 lambda v: "".join(c for c in str(v) if c.isdigit()) if pd.notna(v) else ""
             )
             df_jug = df_jug[df_jug[col_celular].str.len() >= 8]
-
-            all_users = q("SELECT id, display_name, chesscom_user, celular FROM users")
-            # mapa 1: por chesscom_user
-            by_chess = {(u["chesscom_user"] or "").lower(): u for u in all_users if u["chesscom_user"]}
-            # mapa 2: por alias  {alias_lower: user_id}
-            all_aliases = q("SELECT user_id, alias FROM chess_aliases")
-            alias_to_uid = {(a["alias"] or "").lower(): a["user_id"] for a in all_aliases}
-            uid_map = {u["id"]: u for u in all_users}
-            # mapa 3: por display_name
-            by_display = {(u["display_name"] or "").lower(): u for u in all_users if u["display_name"]}
-
-            def find_user(username_raw, nombre_raw):
-                key = username_raw.lower()
-                if key and key in by_chess:
-                    return by_chess[key], "usuario"
-                if key and key in alias_to_uid:
-                    return uid_map[alias_to_uid[key]], "alias"
-                # fallback: nombre del Excel contra display_name
-                nkey = nombre_raw.lower()
-                if nkey and nkey in by_display:
-                    return by_display[nkey], "nombre"
-                return None, None
-
-            preview = []
-            updates = []
+            find = _build_user_maps()
+            updates, preview = [], []
             for _, row in df_jug.iterrows():
-                username_raw = str(row[col_usuario]).strip() if pd.notna(row[col_usuario]) else ""
-                nombre_raw   = str(row[col_nombre]).strip()  if pd.notna(row[col_nombre])  else ""
-                celular_raw  = str(row[col_celular]).strip()
-                u, via = find_user(username_raw, nombre_raw)
+                usr = str(row[col_usuario]).strip() if pd.notna(row[col_usuario]) else ""
+                nom = str(row[col_nombre]).strip()  if pd.notna(row[col_nombre])  else ""
+                cel = str(row[col_celular]).strip()
+                u, via = find(usr, nom)
                 if u:
-                    preview.append({
-                        "Chess.com": u["chesscom_user"],
-                        "Nombre": u["display_name"],
-                        "Celular actual": u.get("celular") or "—",
-                        "Celular nuevo": celular_raw,
-                        "Via": via,
-                        "Acción": "actualizar" if (u.get("celular") or "") != celular_raw else "sin cambio",
-                    })
-                    if (u.get("celular") or "") != celular_raw:
-                        updates.append((celular_raw, u["id"]))
+                    preview.append({"Chess.com": u["chesscom_user"], "Nombre": u["display_name"],
+                                    "Celular nuevo": cel, "Via": via,
+                                    "Acción": "actualizar" if (u.get("celular") or "") != cel else "sin cambio"})
+                    if (u.get("celular") or "") != cel:
+                        updates.append((cel, u["id"]))
                 else:
-                    preview.append({
-                        "Chess.com": username_raw or nombre_raw,
-                        "Nombre": nombre_raw,
-                        "Celular actual": "—",
-                        "Celular nuevo": celular_raw,
-                        "Via": "—",
-                        "Acción": "⚠️ no encontrado",
-                    })
-
+                    preview.append({"Chess.com": usr or nom, "Nombre": nom,
+                                    "Celular nuevo": cel, "Via": "—", "Acción": "⚠️ no encontrado"})
             st.dataframe(preview, use_container_width=True)
-            n_updates = len(updates)
-            n_notfound = sum(1 for p in preview if p["Acción"] == "⚠️ no encontrado")
-            st.caption(f"{n_updates} actualización(es) pendiente(s)  ·  {n_notfound} usuario(s) no encontrado(s) en la base")
-
-            if n_updates > 0 and st.button(f"💾 Importar {n_updates} celular(es)"):
+            st.caption(f"{len(updates)} actualización(es) · {sum(1 for p in preview if '⚠️' in p['Acción'])} no encontrado(s)")
+            if updates and st.button(f"💾 Confirmar {len(updates)} celular(es)", key="cel_confirm"):
                 for cel, uid in updates:
                     exec_sql("UPDATE users SET celular=? WHERE id=?", (cel, uid))
-                st.success(f"✅ {n_updates} celular(es) importados correctamente.")
+                st.success(f"✅ {len(updates)} celular(es) importados.")
                 st.rerun()
         except Exception as exc:
-            st.error(f"Error al leer el Excel: {exc}")
+            st.error(f"Error: {exc}")
 
+    # ── Importar nombres y alias ────────────────────────────
     st.subheader("📋 Importar nombres y alias desde Excel")
-    st.caption("Subí el Excel con la hoja 'jugadores' (columnas: Cod, Nombre, Usuario, Alias, Celular, …)")
-    names_file = st.file_uploader("Archivo Excel (.xlsx)", type=["xlsx"], key="names_import")
-    if names_file:
+    if _storage_secrets_ok() and st.button("📥 Importar nombres/alias desde Supabase Storage", key="alias_from_storage"):
         try:
-            df_names = pd.read_excel(names_file, sheet_name="jugadores", header=0)
-            df_names.columns = [str(c).strip() for c in df_names.columns]
-            col_nombre_n  = df_names.columns[1]
-            col_usuario_n = df_names.columns[2]
-            col_alias_n   = df_names.columns[3]
-
-            all_users_n = q("SELECT id, display_name, chesscom_user, short_name FROM users")
-            by_chess_n  = {(u["chesscom_user"] or "").lower(): u for u in all_users_n if u["chesscom_user"]}
-            by_disp_n   = {(u["display_name"] or "").lower(): u for u in all_users_n if u["display_name"]}
-            all_aliases_n  = q("SELECT user_id, alias FROM chess_aliases")
-            alias_uid_n    = {(a["alias"] or "").lower(): a["user_id"] for a in all_aliases_n}
-            uid_map_n      = {u["id"]: u for u in all_users_n}
-
-            def find_user_n(username_raw, nombre_raw):
-                key = (username_raw or "").lower()
-                if key and key in by_chess_n:
-                    return by_chess_n[key], "usuario"
-                if key and key in alias_uid_n:
-                    return uid_map_n[alias_uid_n[key]], "alias"
-                nkey = (nombre_raw or "").lower()
-                if nkey and nkey in by_disp_n:
-                    return by_disp_n[nkey], "nombre"
-                return None, None
-
-            preview_n = []
-            updates_n = []
-            for _, row in df_names.iterrows():
-                username_raw_n = str(row[col_usuario_n]).strip() if pd.notna(row[col_usuario_n]) else ""
-                nombre_raw_n   = str(row[col_nombre_n]).strip()  if pd.notna(row[col_nombre_n])  else ""
-                alias_raw_n    = str(row[col_alias_n]).strip().upper() if pd.notna(row[col_alias_n]) and str(row[col_alias_n]).strip() not in ("nan", "") else ""
-                u_n, via_n = find_user_n(username_raw_n, nombre_raw_n)
-                if u_n:
-                    new_display = nombre_raw_n or u_n["display_name"]
-                    new_short   = alias_raw_n or u_n.get("short_name") or ""
-                    changed = (u_n.get("short_name") or "") != new_short
-                    preview_n.append({
-                        "Chess.com": u_n["chesscom_user"],
-                        "Nombre Excel": nombre_raw_n,
-                        "Alias": new_short or "—",
-                        "Alias actual": u_n.get("short_name") or "—",
-                        "Via": via_n,
-                        "Acción": "actualizar" if changed else "sin cambio",
-                    })
+            df_n = _load_excel_df()
+            col_nombre_n  = df_n.columns[1]
+            col_usuario_n = df_n.columns[2]
+            col_alias_n   = df_n.columns[3]
+            find = _build_user_maps()
+            updates_n, preview_n = [], []
+            for _, row in df_n.iterrows():
+                usr = str(row[col_usuario_n]).strip() if pd.notna(row[col_usuario_n]) else ""
+                nom = str(row[col_nombre_n]).strip()  if pd.notna(row[col_nombre_n])  else ""
+                ali = str(row[col_alias_n]).strip().upper() if pd.notna(row[col_alias_n]) and str(row[col_alias_n]).strip() not in ("nan", "") else ""
+                u, via = find(usr, nom)
+                if u:
+                    new_short = ali or u.get("short_name") or ""
+                    changed = (u.get("short_name") or "") != new_short
+                    preview_n.append({"Chess.com": u["chesscom_user"], "Nombre": nom,
+                                      "Alias nuevo": new_short or "—", "Alias actual": u.get("short_name") or "—",
+                                      "Via": via, "Acción": "actualizar" if changed else "sin cambio"})
                     if changed:
-                        updates_n.append((new_short, u_n["id"]))
+                        updates_n.append((nom, new_short, u["id"]))
                 else:
-                    preview_n.append({
-                        "Chess.com": username_raw_n or nombre_raw_n,
-                        "Nombre Excel": nombre_raw_n,
-                        "Alias": alias_raw_n or "—",
-                        "Alias actual": "—",
-                        "Via": "—",
-                        "Acción": "⚠️ no encontrado",
-                    })
-
+                    preview_n.append({"Chess.com": usr or nom, "Nombre": nom,
+                                      "Alias nuevo": ali or "—", "Alias actual": "—",
+                                      "Via": "—", "Acción": "⚠️ no encontrado"})
             st.dataframe(preview_n, use_container_width=True)
-            n_upd_n = len(updates_n)
-            n_nf_n  = sum(1 for p in preview_n if p["Acción"] == "⚠️ no encontrado")
-            st.caption(f"{n_upd_n} actualización(es) pendiente(s)  ·  {n_nf_n} usuario(s) no encontrado(s)")
-
-            if n_upd_n > 0 and st.button(f"💾 Importar {n_upd_n} alias"):
-                for short, uid in updates_n:
-                    exec_sql("UPDATE users SET short_name=? WHERE id=?", (short, uid))
-                st.success(f"✅ {n_upd_n} alias importados correctamente.")
+            st.caption(f"{len(updates_n)} actualización(es) · {sum(1 for p in preview_n if '⚠️' in p['Acción'])} no encontrado(s)")
+            if updates_n and st.button(f"💾 Confirmar {len(updates_n)} nombre(s)/alias", key="alias_confirm"):
+                for nom, short, uid in updates_n:
+                    exec_sql("UPDATE users SET display_name=?, short_name=? WHERE id=?", (nom, short, uid))
+                st.success(f"✅ {len(updates_n)} registro(s) importados.")
                 st.rerun()
         except Exception as exc:
-            st.error(f"Error al leer el Excel: {exc}")
+            st.error(f"Error: {exc}")
 
     if labels and is_admin(current_user):
         st.subheader("Cambiar rol / estado / ELO")
