@@ -3353,13 +3353,17 @@ elif admin_choice == "Torneos Admin":
         # ── TAB INFORMES ──────────────────────────────────────────────
         with tab_inf:
             reports = q("""
-                SELECT mr.*, mr.round_num AS round_num_db
+                SELECT mr.*,
+                       m.status AS match_status, m.result AS match_result, m.result_type AS match_result_type,
+                       wu.display_name AS white_name, bu.display_name AS black_name
                 FROM match_reports mr
+                LEFT JOIN matches m ON m.id = mr.match_id
+                LEFT JOIN users wu ON wu.id = m.white_user_id
+                LEFT JOIN users bu ON bu.id = m.black_user_id
                 WHERE mr.tournament_id=? AND mr.resolved=0
                 ORDER BY mr.created_at DESC
             """, (t["id"],))
 
-            # Also show resolved ones in expander
             resolved_reports = q("""
                 SELECT * FROM match_reports WHERE tournament_id=? AND resolved=1 ORDER BY created_at DESC LIMIT 50
             """, (t["id"],))
@@ -3369,15 +3373,43 @@ elif admin_choice == "Torneos Admin":
             else:
                 st.warning(f"⚠️ {len(reports)} informe(s) pendiente(s) de partidas jugadas fuera de condiciones.")
                 for rp in reports:
-                    with st.expander(f"R{rp['round_num']}  {rp['white_chess']} vs {rp['black_chess']}  —  {rp['alert_type']}", expanded=True):
+                    w_label = rp.get("white_name") or rp["white_chess"]
+                    b_label = rp.get("black_name") or rp["black_chess"]
+                    with st.expander(f"R{rp['round_num']}  {w_label} vs {b_label}  —  {rp['alert_type']}", expanded=True):
                         st.write(f"**Detalle:** {rp['detail']}")
                         if rp["game_url"]:
-                            st.write(f"**Partida:** {rp['game_url']}")
+                            st.markdown(f"**Partida detectada:** [{rp['game_url']}]({rp['game_url']})")
                         st.caption(f"Detectado: {rp['created_at']}")
-                        if st.button("✅ Marcar como resuelto", key=f"resolve_report_{rp['id']}"):
-                            exec_sql("UPDATE match_reports SET resolved=1 WHERE id=?", (rp["id"],))
-                            st.success("Marcado como resuelto.")
-                            st.rerun()
+
+                        m_status = rp.get("match_status") or "—"
+                        m_result = rp.get("match_result") or "sin resultado"
+                        if m_status == "finished":
+                            st.info(f"Partida del torneo: **{m_result}** (ya finalizada)")
+                            if st.button("✅ Marcar informe como resuelto", key=f"resolve_report_{rp['id']}"):
+                                exec_sql("UPDATE match_reports SET resolved=1 WHERE id=?", (rp["id"],))
+                                st.success("Resuelto.")
+                                st.rerun()
+                        else:
+                            st.warning(f"Partida del torneo: **pendiente** — podés cargar el resultado aquí.")
+                            ri_col, rb_col1, rb_col2 = st.columns([3, 2, 2])
+                            res_choice = ri_col.selectbox(
+                                "Resultado",
+                                ["1-0", "0-1", "1/2-1/2"],
+                                key=f"inf_res_{rp['id']}",
+                                help=f"Blancas: {rp['white_chess']} — Negras: {rp['black_chess']}"
+                            )
+                            if rb_col1.button("💾 Guardar resultado", key=f"inf_save_{rp['id']}"):
+                                try:
+                                    set_manual_result(rp["match_id"], res_choice, current_user["id"])
+                                    exec_sql("UPDATE match_reports SET resolved=1 WHERE id=?", (rp["id"],))
+                                    st.success(f"Resultado {res_choice} guardado y informe resuelto.")
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.error(exc)
+                            if rb_col2.button("✅ Solo resolver (sin resultado)", key=f"resolve_report_{rp['id']}"):
+                                exec_sql("UPDATE match_reports SET resolved=1 WHERE id=?", (rp["id"],))
+                                st.success("Informe marcado como resuelto.")
+                                st.rerun()
 
             if resolved_reports:
                 with st.expander(f"Historial ({len(resolved_reports)} resueltos)"):
