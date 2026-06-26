@@ -3308,6 +3308,21 @@ elif admin_choice == "Torneos Admin":
                     _fecha_label, _hora_label = _fecha_es(end_dt)
                     st.subheader(f"Ronda {round_num}  ·  vence {fecha_str}")
 
+                    # Días restantes para el fin de la ronda
+                    _now = dt.datetime.now()
+                    if end_dt:
+                        _dias_rest = (end_dt.date() - _now.date()).days
+                        if _dias_rest > 1:
+                            _faltan_str = f"Faltan {_dias_rest} días para finalizar la ronda."
+                        elif _dias_rest == 1:
+                            _faltan_str = "Falta 1 día para finalizar la ronda."
+                        elif _dias_rest == 0:
+                            _faltan_str = "La ronda finaliza hoy."
+                        else:
+                            _faltan_str = "La ronda ya venció."
+                    else:
+                        _faltan_str = ""
+
                     for m in matches_r:
                         _pos_m = _match_pos.get(m["id"], "?")
                         _pos_m_str = f"P{_pos_m:02d}" if isinstance(_pos_m, int) else f"P{_pos_m}"
@@ -3318,14 +3333,14 @@ elif admin_choice == "Torneos Admin":
                         _nomencl = f"{_t_abbr} R{round_num} {_pos_m_str} {_ws_m}# - #{_bs_m}"
                         msg_w = (
                             f"Hola {m['white_name']}. La Ronda N°{round_num} del Torneo {_t_num_str} "
-                            f"finaliza el {_fecha_label} a {_hora_label}hs. "
+                            f"finaliza el {_fecha_label} a {_hora_label}hs. {_faltan_str} "
                             f"Tu contrincante es {m['black_name']}"
                             + (f" @{_bcel_549}" if _bcel_549 else "") +
                             f". Nomenclatura del resultado: {_nomencl}"
                         )
                         msg_b = (
                             f"Hola {m['black_name']}. La Ronda N°{round_num} del Torneo {_t_num_str} "
-                            f"finaliza el {_fecha_label} a {_hora_label}hs. "
+                            f"finaliza el {_fecha_label} a {_hora_label}hs. {_faltan_str} "
                             f"Tu contrincante es {m['white_name']}"
                             + (f" @{_wcel_549}" if _wcel_549 else "") +
                             f". Nomenclatura del resultado: {_nomencl}"
