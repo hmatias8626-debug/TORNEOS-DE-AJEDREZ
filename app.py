@@ -1522,7 +1522,7 @@ def standings(tournament_id):
     points_cfg = tournament_points_config(tournament or {})
 
     regs = q("""
-        SELECT u.id, u.display_name, u.chesscom_user, u.elo, r.status, r.wo_count
+        SELECT u.id, u.display_name, u.chesscom_user, u.elo, u.short_name, r.status, r.wo_count
         FROM registrations r
         JOIN users u ON u.id=r.user_id
         WHERE r.tournament_id=? AND r.status!='removed'
@@ -1598,6 +1598,7 @@ def standings(tournament_id):
 
         table.append({
             "Jugador": user["display_name"],
+            "Alias": user.get("short_name") or "",
             "Chess.com": user["chesscom_user"],
             "ELO": user["elo"],
             "PJ reales": real_played,
@@ -1608,12 +1609,42 @@ def standings(tournament_id):
             "WO": user["wo_count"],
             "Estado": user["status"],
             "Puntos": base_points[uid],
-            "Buchholz": round(buchholz, 2),
+            "BucT": round(buchholz, 2),
             "Buc1": round(buc1, 2),
         })
 
-    table.sort(key=lambda x: (x["Estado"] != "disqualified", x["Puntos"], x["Buchholz"], x["Buc1"], x["ELO"], x["G"]), reverse=True)
+    table.sort(key=lambda x: (x["Estado"] != "disqualified", x["Puntos"], x["BucT"], x["Buc1"], x["ELO"], x["G"]), reverse=True)
     return table
+
+
+def standings_display(tournament_id):
+    """Tabla de posiciones formateada: N° con rangos de empate, Alias, Puntos, Buc1, BucT."""
+    table = standings(tournament_id)
+    if not table:
+        return []
+    result = []
+    i = 0
+    while i < len(table):
+        row = table[i]
+        pts  = row["Puntos"]
+        buct = row["BucT"]
+        buc1 = row["Buc1"]
+        j = i + 1
+        while j < len(table) and table[j]["Puntos"] == pts and table[j]["BucT"] == buct and table[j]["Buc1"] == buc1:
+            j += 1
+        rank = str(i + 1) if j == i + 1 else f"{i + 1}-{j}"
+        for k in range(i, j):
+            r = table[k]
+            result.append({
+                "N°":     rank,
+                "Nombre": r["Jugador"],
+                "Alias":  r["Alias"],
+                "Puntos": r["Puntos"],
+                "Buc1":   r["Buc1"],
+                "BucT":   r["BucT"],
+            })
+        i = j
+    return result
 
 
 
@@ -1970,7 +2001,7 @@ def render_player_tournament_view(tournament, user):
     tabs = st.tabs(["Tabla", "Mis cruces", "Rondas", "Playoffs", "Destacados"])
 
     with tabs[0]:
-        st.dataframe(standings(tournament["id"]), use_container_width=True, hide_index=True)
+        st.dataframe(standings_display(tournament["id"]), use_container_width=True, hide_index=True)
 
     with tabs[1]:
         rows = player_match_rows(tournament["id"], user["id"])
@@ -3388,7 +3419,7 @@ elif admin_choice == "Torneos Admin":
                 } for m in all_cruces], use_container_width=True)
 
             with st.expander("Tabla de posiciones"):
-                st.dataframe(standings(t["id"]), use_container_width=True)
+                st.dataframe(standings_display(t["id"]), use_container_width=True, hide_index=True)
 
         # ── TAB PLAYOFFS ──────────────────────────────────────────────
         with tab_playoffs:
