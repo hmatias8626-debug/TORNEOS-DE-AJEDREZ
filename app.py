@@ -543,6 +543,7 @@ def ensure_v9_columns():
         ("tournaments", "qualifiers_count", "INTEGER DEFAULT 24"),
         ("tournaments", "cup_size", "INTEGER DEFAULT 8"),
         ("users", "celular", "TEXT"),
+        ("users", "short_name", "TEXT"),
     ]
     for table, col, definition in cols:
         ensure_column_runtime(table, col, definition)
@@ -2918,8 +2919,8 @@ elif admin_choice == "Torneos Admin":
 
         pending_wa = q("""
             SELECT m.id, r.number AS round_num, r.end_datetime,
-                   wu.display_name AS white_name, wu.chesscom_user AS white_chess, wu.celular AS white_cel,
-                   bu.display_name AS black_name, bu.chesscom_user AS black_chess, bu.celular AS black_cel
+                   wu.display_name AS white_name, wu.chesscom_user AS white_chess, wu.celular AS white_cel, wu.short_name AS white_short,
+                   bu.display_name AS black_name, bu.chesscom_user AS black_chess, bu.celular AS black_cel, bu.short_name AS black_short
             FROM matches m
             JOIN rounds r ON r.id=m.round_id
             JOIN users wu ON wu.id=m.white_user_id
@@ -3158,9 +3159,33 @@ elif admin_choice == "Torneos Admin":
                 for m in pending_wa:
                     by_round[m["round_num"]].append(m)
 
+                _DAYS_ES   = ["lunes","martes","miércoles","jueves","viernes","sábado","domingo"]
+                _MONTHS_ES = ["enero","febrero","marzo","abril","mayo","junio",
+                               "julio","agosto","septiembre","octubre","noviembre","diciembre"]
+
+                def _fecha_es(dt):
+                    if not dt:
+                        return "—", "—"
+                    dia_es  = _DAYS_ES[dt.weekday()]
+                    mes_es  = _MONTHS_ES[dt.month - 1]
+                    dia_num = dt.day
+                    hora    = dt.strftime("%H:%M")
+                    return f"{dia_es} {dia_num} {mes_es}", hora
+
+                def _norm_cel_549(cel):
+                    if not cel:
+                        return ""
+                    n = "".join(c for c in str(cel) if c.isdigit())
+                    if not n:
+                        return ""
+                    if not n.startswith("549"):
+                        n = "549" + (n[2:] if n.startswith("54") else n)
+                    return n
+
                 # ── Mensaje para grupo ──────────────────────────────────
                 _t_num = _re.search(r'\d+', t["name"])
                 _t_abbr = f"T{_t_num.group()}" if _t_num else f"T{t['id']}"
+                _t_num_str = _t_num.group() if _t_num else str(t["id"])
 
                 # Posición de cada partida dentro de su ronda
                 _match_pos = {}
@@ -3179,11 +3204,13 @@ elif admin_choice == "Torneos Admin":
                     for _m in by_round[_rn]:
                         _pos = _match_pos.get(_m["id"], "?")
                         _pos_str = f"P{_pos:02d}" if isinstance(_pos, int) else f"P{_pos}"
-                        _wc = "".join(c for c in str(_m["white_cel"]) if c.isdigit()) if _m["white_cel"] else ""
-                        _bc = "".join(c for c in str(_m["black_cel"]) if c.isdigit()) if _m["black_cel"] else ""
+                        _wc = _norm_cel_549(_m["white_cel"])
+                        _bc = _norm_cel_549(_m["black_cel"])
                         _wa_w = f"@{_wc}" if _wc else f"({_m['white_name']})"
                         _wa_b = f"@{_bc}" if _bc else f"({_m['black_name']})"
-                        _group_lines.append(f"{_t_abbr} R{_rn} {_pos_str}  {_m['white_name']} vs {_m['black_name']}")
+                        _ws = _m["white_short"] or _m["white_chess"] or _m["white_name"][:3].upper()
+                        _bs = _m["black_short"] or _m["black_chess"] or _m["black_name"][:3].upper()
+                        _group_lines.append(f"{_t_abbr} R{_rn} {_pos_str}  {_ws}# - #{_bs}")
                         _group_lines.append(f"{_wa_w} {_m['white_chess']} vs {_m['black_chess'] or '—'} {_wa_b}")
                         _group_lines.append("")
 
@@ -3200,22 +3227,30 @@ elif admin_choice == "Torneos Admin":
                     matches_r = by_round[round_num]
                     end_dt = parse_db_datetime(matches_r[0]["end_datetime"])
                     fecha_str = end_dt.strftime("%d/%m/%Y %H:%M") if end_dt else "—"
+                    _fecha_label, _hora_label = _fecha_es(end_dt)
                     st.subheader(f"Ronda {round_num}  ·  vence {fecha_str}")
 
                     for m in matches_r:
+                        _pos_m = _match_pos.get(m["id"], "?")
+                        _pos_m_str = f"P{_pos_m:02d}" if isinstance(_pos_m, int) else f"P{_pos_m}"
+                        _ws_m = m["white_short"] or (m["white_chess"] or m["white_name"])[:3].upper()
+                        _bs_m = m["black_short"] or (m["black_chess"] or m["black_name"])[:3].upper()
+                        _wcel_549 = _norm_cel_549(m["white_cel"])
+                        _bcel_549 = _norm_cel_549(m["black_cel"])
+                        _nomencl = f"{_t_abbr} R{round_num} {_pos_m_str} {_ws_m}# - #{_bs_m}"
                         msg_w = (
-                            f"Hola {m['white_name']}! ♟️ Recordatorio del {t['name']}.\n"
-                            f"Tenés una partida pendiente de la Ronda {round_num} "
-                            f"que vence el {fecha_str}.\n"
-                            f"Tu rival es {m['black_name']} ({m['black_chess'] or '—'}).\n"
-                            f"¡Coordiná y jugá antes del vencimiento!"
+                            f"Hola {m['white_name']}. La Ronda N°{round_num} del Torneo {_t_num_str} "
+                            f"finaliza el {_fecha_label} a {_hora_label}hs. "
+                            f"Tu contrincante es {m['black_name']}"
+                            + (f" @{_bcel_549}" if _bcel_549 else "") +
+                            f". Nomenclatura del resultado: {_nomencl}"
                         )
                         msg_b = (
-                            f"Hola {m['black_name']}! ♟️ Recordatorio del {t['name']}.\n"
-                            f"Tenés una partida pendiente de la Ronda {round_num} "
-                            f"que vence el {fecha_str}.\n"
-                            f"Tu rival es {m['white_name']} ({m['white_chess'] or '—'}).\n"
-                            f"¡Coordiná y jugá antes del vencimiento!"
+                            f"Hola {m['black_name']}. La Ronda N°{round_num} del Torneo {_t_num_str} "
+                            f"finaliza el {_fecha_label} a {_hora_label}hs. "
+                            f"Tu contrincante es {m['white_name']}"
+                            + (f" @{_wcel_549}" if _wcel_549 else "") +
+                            f". Nomenclatura del resultado: {_nomencl}"
                         )
 
                         col_w, col_vs, col_b = st.columns([5, 1, 5])
@@ -3514,6 +3549,79 @@ elif admin_choice == "Admin usuarios":
                 for cel, uid in updates:
                     exec_sql("UPDATE users SET celular=? WHERE id=?", (cel, uid))
                 st.success(f"✅ {n_updates} celular(es) importados correctamente.")
+                st.rerun()
+        except Exception as exc:
+            st.error(f"Error al leer el Excel: {exc}")
+
+    st.subheader("📋 Importar nombres y alias desde Excel")
+    st.caption("Subí el Excel con la hoja 'jugadores' (columnas: Cod, Nombre, Usuario, Alias, Celular, …)")
+    names_file = st.file_uploader("Archivo Excel (.xlsx)", type=["xlsx"], key="names_import")
+    if names_file:
+        try:
+            df_names = pd.read_excel(names_file, sheet_name="jugadores", header=0)
+            df_names.columns = [str(c).strip() for c in df_names.columns]
+            col_nombre_n  = df_names.columns[1]
+            col_usuario_n = df_names.columns[2]
+            col_alias_n   = df_names.columns[3]
+
+            all_users_n = q("SELECT id, display_name, chesscom_user, short_name FROM users")
+            by_chess_n  = {(u["chesscom_user"] or "").lower(): u for u in all_users_n if u["chesscom_user"]}
+            by_disp_n   = {(u["display_name"] or "").lower(): u for u in all_users_n if u["display_name"]}
+            all_aliases_n  = q("SELECT user_id, alias FROM chess_aliases")
+            alias_uid_n    = {(a["alias"] or "").lower(): a["user_id"] for a in all_aliases_n}
+            uid_map_n      = {u["id"]: u for u in all_users_n}
+
+            def find_user_n(username_raw, nombre_raw):
+                key = (username_raw or "").lower()
+                if key and key in by_chess_n:
+                    return by_chess_n[key], "usuario"
+                if key and key in alias_uid_n:
+                    return uid_map_n[alias_uid_n[key]], "alias"
+                nkey = (nombre_raw or "").lower()
+                if nkey and nkey in by_disp_n:
+                    return by_disp_n[nkey], "nombre"
+                return None, None
+
+            preview_n = []
+            updates_n = []
+            for _, row in df_names.iterrows():
+                username_raw_n = str(row[col_usuario_n]).strip() if pd.notna(row[col_usuario_n]) else ""
+                nombre_raw_n   = str(row[col_nombre_n]).strip()  if pd.notna(row[col_nombre_n])  else ""
+                alias_raw_n    = str(row[col_alias_n]).strip().upper() if pd.notna(row[col_alias_n]) and str(row[col_alias_n]).strip() not in ("nan", "") else ""
+                u_n, via_n = find_user_n(username_raw_n, nombre_raw_n)
+                if u_n:
+                    new_display = nombre_raw_n or u_n["display_name"]
+                    new_short   = alias_raw_n or u_n.get("short_name") or ""
+                    changed = (u_n.get("short_name") or "") != new_short
+                    preview_n.append({
+                        "Chess.com": u_n["chesscom_user"],
+                        "Nombre Excel": nombre_raw_n,
+                        "Alias": new_short or "—",
+                        "Alias actual": u_n.get("short_name") or "—",
+                        "Via": via_n,
+                        "Acción": "actualizar" if changed else "sin cambio",
+                    })
+                    if changed:
+                        updates_n.append((new_short, u_n["id"]))
+                else:
+                    preview_n.append({
+                        "Chess.com": username_raw_n or nombre_raw_n,
+                        "Nombre Excel": nombre_raw_n,
+                        "Alias": alias_raw_n or "—",
+                        "Alias actual": "—",
+                        "Via": "—",
+                        "Acción": "⚠️ no encontrado",
+                    })
+
+            st.dataframe(preview_n, use_container_width=True)
+            n_upd_n = len(updates_n)
+            n_nf_n  = sum(1 for p in preview_n if p["Acción"] == "⚠️ no encontrado")
+            st.caption(f"{n_upd_n} actualización(es) pendiente(s)  ·  {n_nf_n} usuario(s) no encontrado(s)")
+
+            if n_upd_n > 0 and st.button(f"💾 Importar {n_upd_n} alias"):
+                for short, uid in updates_n:
+                    exec_sql("UPDATE users SET short_name=? WHERE id=?", (short, uid))
+                st.success(f"✅ {n_upd_n} alias importados correctamente.")
                 st.rerun()
         except Exception as exc:
             st.error(f"Error al leer el Excel: {exc}")
