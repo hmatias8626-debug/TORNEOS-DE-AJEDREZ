@@ -1662,15 +1662,31 @@ def match_score_parts(result, result_type):
     return ("", "")
 
 
-def wa_link(celular, mensaje):
-    """Devuelve URL de WhatsApp con mensaje pregenerado. Celular sin código país (ej: 3815123456)."""
+def _normalize_wa_number(celular):
+    """Normaliza un número para WhatsApp internacional.
+    - Números argentinos (10 dígitos o con prefijo 54): convierte a formato 549XXXXXXXXXX
+    - Números con otro prefijo de país ya incluido: los deja tal cual (ej: 34XXX España)
+    """
     if not celular:
         return None
     n = "".join(c for c in str(celular) if c.isdigit())
     if not n:
         return None
-    if not n.startswith("549"):
-        n = "549" + (n[2:] if n.startswith("54") else n)
+    if n.startswith("549"):
+        return n                        # ya en formato argentino correcto
+    if n.startswith("54"):
+        return "549" + n[2:]           # argentino con 54 pero sin el 9 de móvil
+    if len(n) == 10:
+        return "549" + n               # argentino sin código de país
+    # número con código de país no argentino (ej: 34XXX España, 1XXX EEUU) → dejar como está
+    return n
+
+
+def wa_link(celular, mensaje):
+    """Devuelve URL de WhatsApp con mensaje pregenerado."""
+    n = _normalize_wa_number(celular)
+    if not n:
+        return None
     return f"https://wa.me/{n}?text={urllib.parse.quote(mensaje)}"
 
 
@@ -3251,14 +3267,7 @@ elif admin_choice == "Torneos Admin":
                     return f"{dia_es} {dia_num} {mes_es}", hora
 
                 def _norm_cel_549(cel):
-                    if not cel:
-                        return ""
-                    n = "".join(c for c in str(cel) if c.isdigit())
-                    if not n:
-                        return ""
-                    if not n.startswith("549"):
-                        n = "549" + (n[2:] if n.startswith("54") else n)
-                    return n
+                    return _normalize_wa_number(cel) or ""
 
                 # ── Mensaje para grupo ──────────────────────────────────
                 _t_num = _re.search(r'\d+', t["name"])
