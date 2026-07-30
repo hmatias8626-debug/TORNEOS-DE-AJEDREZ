@@ -30,7 +30,7 @@ def has_pg_secrets():
 
 
 def use_postgres():
-    return has_pg_secrets()
+    return False
 
 
 def pg_conn():
