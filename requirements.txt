@@ -1,4 +1,5 @@
 streamlit
-requests
 pandas
+sqlalchemy
+openpyxl
 psycopg2-binary
